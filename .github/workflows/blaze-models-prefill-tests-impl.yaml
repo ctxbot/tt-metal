@@ -37,6 +37,16 @@ on:
         type: number
         default: 10
         description: "Seconds without dispatch progress before tt-triage fires on the hung rank(s). 0 or less disables hang detection (the runtime treats any non-positive duration as no timeout)."
+      self-allocating:
+        required: false
+        type: boolean
+        default: false
+        description: >-
+          True for SKUs whose runner owns its galaxies (the runner is the allocation,
+          e.g. exabox-multihost-ci-sc4). Such SKUs carry no `allocation` field in
+          sku_config.yaml: the job provisions its remote workers through a container hook
+          (a job-level container) instead of the ttop create-allocation/environment steps,
+          which are skipped along with their deletes.
 
 permissions:
   id-token: write
@@ -156,6 +166,11 @@ jobs:
       matrix:
         test-group: ${{ fromJson(needs.load-test-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.test-group.runs_on }}
+    # A self-allocating runner provisions its remote worker pods through a container hook
+    # that fires only when the job declares a container. Non-self-allocating SKUs keep the
+    # ttop-create-environment path and must NOT run in a container, so this resolves to null
+    # (no container) for them.
+    container: ${{ inputs.self-allocating && inputs.docker-image || null }}
     outputs:
       test-result: ${{ steps.run-test.outcome }}
     steps:
@@ -174,6 +189,7 @@ jobs:
 
       - name: Extract allocation spec from SKU
         id: extract-spec
+        if: ${{ !inputs.self-allocating }}
         run: |
           pip3 install PyYAML
           {
@@ -187,6 +203,7 @@ jobs:
 
       - name: Create allocation for ${{ matrix.test-group.name }}
         id: allocation
+        if: ${{ !inputs.self-allocating }}
         uses: ./.github/actions/ttop-create-allocation
         timeout-minutes: 120
         with:
@@ -195,12 +212,14 @@ jobs:
           spec: ${{ steps.extract-spec.outputs.allocation_spec }}
 
       - name: Get allocation configs
+        if: ${{ !inputs.self-allocating }}
         uses: ./.github/actions/ttop-get-allocation-data
         with:
           allocationName: ci-${{ github.run_id }}-${{ inputs.sp-config }}-${{ inputs.resource-prefix }}-${{ strategy.job-index }}
           allocationNamespace: ttop-ci
 
       - name: Create test environment
+        if: ${{ !inputs.self-allocating }}
         uses: ./.github/actions/ttop-create-environment
         timeout-minutes: 30
         with:
@@ -480,14 +499,14 @@ jobs:
           job-name: ${{ matrix.test-group.name }}
 
       - name: Delete test environment
-        if: always()
+        if: ${{ always() && !inputs.self-allocating }}
         uses: ./.github/actions/ttop-delete-environment
         with:
           environmentName:  ci-${{ github.run_id }}-${{ inputs.sp-config }}-${{ inputs.resource-prefix }}-${{ strategy.job-index }}
           namespace: ttop-ci
 
       - name: Delete allocation
-        if: always()
+        if: ${{ always() && !inputs.self-allocating }}
         uses: ./.github/actions/ttop-delete-allocation
         with:
           allocationName:  ci-${{ github.run_id }}-${{ inputs.sp-config }}-${{ inputs.resource-prefix }}-${{ strategy.job-index }}

@@ -151,6 +151,10 @@ jobs:
       sp-config: sc4-blitz
       test-type: ${{ needs.validate-test-type.outputs.test-type }}
       resource-prefix: sc4-blitz
+      # bh_sc4-blitz runs on the self-allocating exabox-multihost-ci-sc4 runner (no
+      # allocation field in sku_config.yaml); provision workers via the container hook
+      # and skip the ttop allocation steps.
+      self-allocating: true
       # The runner is a server that idles in an unbounded request loop until the producer
       # connects and drives H2D, so no device op completes for tens of seconds by design.
       # The default operation-timeout watchdog would fire mid-idle, run tt-triage (which
