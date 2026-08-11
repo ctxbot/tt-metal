@@ -696,13 +696,10 @@ def _verify_dst_vs_golden(table, device_map: dict, triples: list, slot_traces: d
     """Golden-anchored DESTINATION check: PCC each migrated dst slot against the SRC slot's golden trace.
     Returns True when every pair meets ``threshold``.
 
-    This is the device-less counterpart of the "AFTER" half of the runner's retired
-    ``validate_migration_kv``. It reuses ``prefill_producer._read_slot_kv_and_check_pcc``
-    unchanged — that reader is already parameterised by
-    slot id, so passing ``dst`` reads the destination, and passing ``slot_traces[src]`` compares it to
-    what the source was supposed to contain. A correct migration makes dst PCC to golden exactly as src
-    does, which is the pair of numbers the old ``[kv-migrate-validate] BEFORE/AFTER`` lines reported
-    (``_verify_resident_slots`` in main() is still the BEFORE half).
+    Reuses ``prefill_producer._read_slot_kv_and_check_pcc`` unchanged — that reader is already
+    parameterised by slot id, so passing ``dst`` reads the destination, and passing ``slot_traces[src]``
+    compares it to what the source was supposed to contain. A correct migration makes dst PCC to golden
+    exactly as src does; ``_verify_resident_slots`` in main() reads the source half of that pair.
 
     Stronger than the byte compare in one way — it proves the copy carries MODEL-CORRECT data rather than
     merely the same bytes the source held, so it also re-confirms prefill itself at the destination — and
