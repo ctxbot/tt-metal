@@ -25,7 +25,7 @@ void kernel_main() {
     Noc noc;
     DataflowBuffer dfb_in0(tt::CBIndex::c_0);
 
-    uint32_t input_tile_bytes = get_tile_size(dfb_in0.get_id());
+    uint32_t input_tile_bytes = dfb_in0.get_tile_size();
     const auto dram_input_addrg = TensorAccessor(dram_input_addrg_args, input_addr);
 
     uint32_t read_tile_id_temp = (dim == 0) ? (start_id) : (start_id / HtWt * CHtWt) + (start_id % HtWt);
