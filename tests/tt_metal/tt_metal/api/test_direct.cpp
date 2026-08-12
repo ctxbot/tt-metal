@@ -35,6 +35,7 @@
 #include "tt_metal/test_utils/df/float32.hpp"
 #include "tt_metal/test_utils/stimulus.hpp"
 #include <tt-metalium/experimental/metal2_host_api/program.hpp>
+#include "tt_metal/impl/dispatch/slow_dispatch.hpp"
 
 using std::vector;
 using namespace tt;
@@ -330,8 +331,8 @@ struct ReaderDatacopyWriterConfig {
 // generated input data (already written to input DRAM), and the per-tile DRAM
 // stride used when wiring reader/writer runtime args.
 struct ReaderDatacopyWriterContext {
-    std::shared_ptr<tt::tt_metal::Buffer> input_dram_buffer;
-    std::shared_ptr<tt::tt_metal::Buffer> output_dram_buffer;
+    std::shared_ptr<distributed::MeshBuffer> input_dram_buffer;
+    std::shared_ptr<distributed::MeshBuffer> output_dram_buffer;
     uint32_t input_dram_byte_address = 0;
     uint32_t output_dram_byte_address = 0;
     size_t byte_size = 0;
@@ -340,19 +341,16 @@ struct ReaderDatacopyWriterContext {
 };
 
 static ReaderDatacopyWriterContext setup_reader_datacopy_writer_context(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device, const ReaderDatacopyWriterConfig& test_config) {
+    distributed::MeshDevice& mesh_device, const ReaderDatacopyWriterConfig& test_config) {
     ReaderDatacopyWriterContext ctx;
     ctx.byte_size = test_config.num_tiles * test_config.tile_byte_size;
 
-    auto* device = mesh_device->get_devices()[0];
-    tt::tt_metal::InterleavedBufferConfig dram_config{
-        .device = device,
-        .size = ctx.byte_size,
-        .page_size = ctx.byte_size,
-        .buffer_type = tt::tt_metal::BufferType::DRAM};
-    ctx.input_dram_buffer = tt_metal::CreateBuffer(dram_config);
+    distributed::DeviceLocalBufferConfig dram_config{
+        .page_size = ctx.byte_size, .buffer_type = tt::tt_metal::BufferType::DRAM};
+    distributed::ReplicatedBufferConfig buffer_config{.size = ctx.byte_size};
+    ctx.input_dram_buffer = distributed::MeshBuffer::create(buffer_config, dram_config, &mesh_device);
+    ctx.output_dram_buffer = distributed::MeshBuffer::create(buffer_config, dram_config, &mesh_device);
     ctx.input_dram_byte_address = ctx.input_dram_buffer->address();
-    ctx.output_dram_buffer = tt_metal::CreateBuffer(dram_config);
     ctx.output_dram_byte_address = ctx.output_dram_buffer->address();
 
     log_info(tt::LogTest, "Input DRAM byte address: {}", ctx.input_dram_byte_address);
@@ -360,7 +358,7 @@ static ReaderDatacopyWriterContext setup_reader_datacopy_writer_context(
 
     ctx.inputs = generate_packed_uniform_random_vector<uint32_t, bfloat16>(
         -1.0f, 1.0f, ctx.byte_size / sizeof(bfloat16), std::chrono::system_clock::now().time_since_epoch().count());
-    tt_metal::detail::WriteToBuffer(ctx.input_dram_buffer, ctx.inputs);
+    slow_dispatch::WriteToBuffer(*ctx.input_dram_buffer, ctx.inputs);
 
     // DRAM buffer uses page_size = byte_size (whole-buffer), so derive the
     // per-tile DRAM stride directly from byte_size / num_tiles.
@@ -371,7 +369,7 @@ static ReaderDatacopyWriterContext setup_reader_datacopy_writer_context(
 
 static bool verify_reader_datacopy_writer_output(const ReaderDatacopyWriterContext& ctx) {
     std::vector<uint32_t> dest_buffer_data;
-    tt_metal::detail::ReadFromBuffer(ctx.output_dram_buffer, dest_buffer_data);
+    slow_dispatch::ReadFromBuffer(*ctx.output_dram_buffer, dest_buffer_data);
     return ctx.inputs == dest_buffer_data;
 }
 
@@ -381,12 +379,10 @@ static bool verify_reader_datacopy_writer_output(const ReaderDatacopyWriterConte
 /// @param device
 /// @param test_config - Configuration of the test -- see struct
 /// @return
-bool reader_datacopy_writer(
-    const std::shared_ptr<distributed::MeshDevice>& mesh_device, const ReaderDatacopyWriterConfig& test_config) {
+bool reader_datacopy_writer(distributed::MeshDevice& mesh_device, const ReaderDatacopyWriterConfig& test_config) {
     auto ctx = setup_reader_datacopy_writer_context(mesh_device, test_config);
-    auto* device = mesh_device->get_devices()[0];
 
-    const bool is_quasar = device->arch() == ARCH::QUASAR;
+    const bool is_quasar = mesh_device.arch() == ARCH::QUASAR;
     // On Quasar we can split work across two DM threads when num_tiles > 1;
     // WH/BH gen1 has one DM thread per processor, so the kernel only runs on
     // a single thread there.
@@ -514,7 +510,7 @@ bool reader_datacopy_writer(
         .work_units = {wu},
     };
 
-    distributed::MeshWorkload workload = experimental::MakeMeshWorkloadFromSpec(*mesh_device, spec);
+    distributed::MeshWorkload workload = experimental::MakeMeshWorkloadFromSpec(mesh_device, spec);
     Program& program = workload.get_programs().begin()->second;
 
     log_info(tt::LogTest, "Num tiles per thread: {}", num_tiles_per_thread);
@@ -543,7 +539,7 @@ bool reader_datacopy_writer(
     };
     experimental::SetProgramRunArgs(program, params);
 
-    distributed::EnqueueMeshWorkload(mesh_device->mesh_command_queue(), workload, /*blocking=*/true);
+    distributed::EnqueueMeshWorkload(mesh_device.mesh_command_queue(), workload, /*blocking=*/true);
 
     return verify_reader_datacopy_writer_output(ctx);
 }
@@ -592,12 +588,12 @@ TEST_F(AnyDispatchMeshDeviceFixture, TensixSingleCoreDirectDramReaderDatacopyWri
     for (auto& device : this->devices_) {
         if (device->arch() != ARCH::QUASAR) {  // Remove when we can run back to back tests on Quasar VCS (on CI)
             test_config.num_tiles = 1;
-            ASSERT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(device, test_config));
+            ASSERT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(*device, test_config));
             test_config.num_tiles = 4;
-            ASSERT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(device, test_config));
+            ASSERT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(*device, test_config));
         }
         test_config.num_tiles = 8;
-        ASSERT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(device, test_config));
+        ASSERT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(*device, test_config));
     }
 }
 
@@ -615,9 +611,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarDatacopyToDestWriter) {
                 .l1_output_data_format = data_format,
                 .node = experimental::NodeCoord(0, 0),
                 .dst_full_sync_en = dst_full_sync_en};
-            for (auto& device : this->devices_) {
-                EXPECT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(device, test_config));
-            }
+            EXPECT_TRUE(unit_tests::dram::direct::reader_datacopy_writer(this->device(), test_config));
         }
     }
 }
