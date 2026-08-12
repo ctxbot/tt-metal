@@ -6,12 +6,20 @@
 
 import os
 import pathlib
+import sys
 from typing import Optional
 
 import pytest
 
 import ttnn
 import ttml
+
+# ``--import-mode=importlib`` (pytest.ini) leaves a test file's own directory off
+# sys.path, so sibling helper modules need it added here, before any test module
+# is imported.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from mesh_test_utils import skip_if_system_too_small  # noqa: E402
 
 
 def pytest_configure(config):
@@ -106,11 +114,13 @@ def _close_device_mesh_quietly() -> None:
 def tp_mesh():
     """A ``[1, 2]`` mesh with axes ``("dp", "tp")``, per requesting module.
 
-    Skips the requesting tests if two devices on the ``"tp"`` axis are unavailable.
-    The parallelism context is initialised here too, since the qwen3 model paths
-    resolve their TP size through it.
+    Skips the requesting tests on a host with too few devices for the shape. A host
+    that has the devices and still fails to open the mesh is a real failure and is
+    reported as one. The parallelism context is initialised here too, since the qwen3
+    model paths resolve their TP size through it.
     """
     dp_expected, tp_expected = TP_MESH_SHAPE
+    skip_if_system_too_small(TP_MESH_SHAPE, "tensor-parallel tests")
     previous_mgd = _ensure_mgd_path(TP_MESH_SHAPE)
     _close_device_mesh_quietly()
     try:
@@ -131,10 +141,10 @@ def tp_mesh():
                 )
         else:
             ctx.initialize_parallelism_context(ttml.autograd.DistributedConfig(enable_ddp=False, enable_tp=True))
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         _close_device_mesh_quietly()
         _restore_mgd_path(previous_mgd)
-        pytest.skip(f"needs a [{dp_expected}, {tp_expected}] 'tp' mesh: {e}")
+        raise
 
     yield ttml.mesh()
 

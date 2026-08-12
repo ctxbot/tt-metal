@@ -44,6 +44,8 @@ import ttnn
 import ttml
 from ttml.modules import AbstractModuleBase, LinearLayer, ModuleList
 
+from mesh_test_utils import skip_if_system_too_small
+
 
 pytestmark = pytest.mark.requires_device
 
@@ -140,7 +142,8 @@ def fsdp_mesh():
 
     A 2D layout with ``dp=1`` keeps the same fixture re-usable for HSDP
     tests later (those need a real ``dp`` axis without re-shaping the
-    mesh). Skips the module if the system can't host the requested mesh.
+    mesh). Skips the module if the host has too few devices for the shape;
+    a host that has them and still fails to open the mesh fails the tests.
 
     If ``TT_MESH_GRAPH_DESC_PATH`` isn't set in the environment, we point
     it at a bundled MGD that matches the host arch + requested shape (see
@@ -148,15 +151,17 @@ def fsdp_mesh():
     The original value is restored at teardown.
     """
     shape = (1, FSDP_AXIS_SIZE)
+    skip_if_system_too_small(shape, "FSDP tests")
     previous_mgd = _ensure_mgd_path(shape)
 
     _close_device_quietly()
     try:
         m = ttml.Mesh(shape, ("dp", "fsdp"))
         ttml.open_device_mesh(m)
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
+        _close_device_mesh_quietly()
         _restore_mgd_path(previous_mgd)
-        pytest.skip(f"FSDP tests need {FSDP_AXIS_SIZE} devices on the 'fsdp' axis: {e}")
+        raise
 
     yield ttml.mesh()
 

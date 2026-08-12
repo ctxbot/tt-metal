@@ -34,6 +34,8 @@ import pytest
 import ttnn
 import ttml
 
+from mesh_test_utils import skip_if_system_too_small
+
 
 pytestmark = pytest.mark.requires_device
 
@@ -66,14 +68,6 @@ def _detect_arch() -> Optional[str]:
     if "wormhole_b0" in name:
         return "wormhole_b0"
     return None
-
-
-def _num_available_devices() -> int:
-    """Total devices visible to the cluster, or 0 if we can't tell."""
-    try:
-        return int(ttnn.distributed.get_num_devices())
-    except Exception:  # noqa: BLE001
-        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -120,22 +114,18 @@ def _skip_if_unsupported(shape: tuple[int, ...]) -> None:
     """Skip the test up-front when the host can't run a ``shape`` mesh.
 
     Two conditions trip a skip:
-      * Cluster has fewer than ``prod(shape)`` chips — e.g. N300 (2)
-        can't host a 2x2 (4) mesh.
+      * Host's devices can't host ``shape`` — e.g. N300 (2) can't host a
+        2x2 (4) mesh.
       * Host arch has no bundled MGD entry for ``shape`` and no
         ``TT_MESH_GRAPH_DESC_PATH`` was supplied — we'd just open and
         crash inside the fabric layer otherwise.
 
     Skipping here, before any device or fabric state has been touched,
     keeps the rest of the test session clean (no leaked fabric config,
-    no half-open mesh).
+    no half-open mesh). A host that passes both checks and still fails to
+    open the mesh is a real failure, not a skip.
     """
-    needed = 1
-    for d in shape:
-        needed *= d
-    available = _num_available_devices()
-    if available and available < needed:
-        pytest.skip(f"CCL topology tests need a {shape} mesh ({needed} chips); host has {available}.")
+    skip_if_system_too_small(shape, "CCL topology tests")
 
     arch = _detect_arch()
     if os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
@@ -151,7 +141,7 @@ def _skip_if_unsupported(shape: tuple[int, ...]) -> None:
 
 
 def _open_mesh_or_skip(shape: tuple[int, ...]):
-    """Open a fresh mesh of ``shape``, skipping the test if not possible.
+    """Open a fresh mesh of ``shape``, skipping only if the host can't host it.
 
     Returns the previous MGD path so a teardown can restore it.
     """
@@ -160,9 +150,10 @@ def _open_mesh_or_skip(shape: tuple[int, ...]):
     _close_device_mesh_quietly()
     try:
         ttml.open_device_mesh(shape)
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
+        _close_device_mesh_quietly()
         _restore_mgd_path(previous_mgd)
-        pytest.skip(f"CCL topology tests need a {shape} mesh: {e}")
+        raise
     return previous_mgd
 
 

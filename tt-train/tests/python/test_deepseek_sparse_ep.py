@@ -46,6 +46,8 @@ import ttml
 from ttml.models.deepseek.moe import MoE
 from ttml.models.deepseek.moe_sparse_ep import SparseMoEEP
 
+from mesh_test_utils import skip_if_system_too_small
+
 SEED = 2026
 
 # Fixed 8x4 mesh: the full 32-chip Blackhole galaxy, DP=8 x EP=4.
@@ -132,16 +134,21 @@ def _restore_mgd_path(previous: Optional[str]) -> None:
 
 @pytest.fixture(scope="module")
 def ep_mesh():
-    """Open the ``[8, 4]`` galaxy mesh with axes ``("dp", "ep")``."""
+    """Open the ``[8, 4]`` galaxy mesh with axes ``("dp", "ep")``.
+
+    Skips on a host too small for the shape; a host that has the devices and still
+    fails to open the mesh fails the tests rather than skipping them.
+    """
     shape = MESH_SHAPE
+    skip_if_system_too_small(shape, f"sparse_ep tests ('ep' axis = {EP_AXIS_SIZE})")
     previous_mgd = _ensure_mgd_path(shape)
 
     _close_device_quietly()
     try:
         ttml.open_device_mesh(ttml.Mesh(shape, ("dp", "ep")))
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         _restore_mgd_path(previous_mgd)
-        pytest.skip(f"sparse_ep tests need a {shape[0]}x{shape[1]} mesh ('ep' axis = {EP_AXIS_SIZE}): {e}")
+        raise
 
     yield ttml.mesh()
 
