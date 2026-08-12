@@ -185,222 +185,196 @@ using MeshWorkloadTest2x4 = MeshDevice2x4Fixture;
 using MeshWorkloadTest4x8 = MeshDevice4x8Fixture;
 using MeshWorkloadTestSuite = GenericMeshDeviceFixture;
 
-// Regression for #26105. The kernel-config ring manager is shared by every device in the mesh, so a workload covering
-// only some devices still frees ring space mesh-wide. The devices that workload skipped must still receive the
-// worker-completion wait that made the space reusable, otherwise their dispatcher writes new kernel config over
-// regions their own workers are still reading. The three phases below mirror that sequence: a large workload on the
-// victim whose worker stays parked, filler workloads that exclude the victim and free the victim's ring space, then a
-// small workload back on the victim. Because the parked worker can never satisfy the freeing wait, that last workload's
-// config must not reach the victim's L1 until the host releases the worker.
-TEST_F(MeshWorkloadTest4x8, ConfigRingWaitDeliveredToUncoveredDevice) {
-    // Upper bound only. Fillers are enqueued one at a time below until the ring frees the parked workload's entry,
-    // because every outstanding workload also consumes a launch-message slot, and exhausting those would force the
-    // probe to carry a sync of its own and mask the bug.
-    constexpr uint32_t max_filler_workloads = 5;
+// A worker still reading its kernel config must not have that config overwritten, including on devices left out of the
+// workloads that follow. The host holds one device's worker while other devices run enough workloads to wrap the
+// mesh-wide config ring back onto the held worker's region.
+TEST_F(MeshWorkloadTest4x8, UnusedDeviceKernelConfigNotOverwritten) {
+    if (mesh_device_->arch() == tt::ARCH::QUASAR) {
+        GTEST_SKIP() << "Host-to-L1 release handshake is not supported on Quasar data movement cores";
+    }
+
+    // Fillers stop as soon as the ring frees the held slot. Extra ones use up the launch-message slots, which would
+    // fence the probe on its own account and hide any overwrite.
+    constexpr uint32_t max_fillers = 5;
     constexpr uint32_t release_value = 0x67216721;
     constexpr uint32_t started_value = 0x5a5a5a5a;
-    constexpr CoreCoord wait_core = {0, 0};
+    constexpr CoreCoord core = {0, 0};
+    const CoreRangeSet core_set(CoreRange(core, core));
+    const std::string blank_kernel = "tests/tt_metal/tt_metal/test_kernels/dataflow/blank.cpp";
 
-    const MeshCoordinate victim_coord(2, 7);
-    const MeshCoordinateRange victim_device(victim_coord, victim_coord);
-    const MeshCoordinateRange other_devices({0, 0}, {3, 6});
+    // The victim is the last device in the mesh; the fillers take every device outside its column.
+    const uint32_t last_row = mesh_device_->num_rows() - 1;
+    const uint32_t last_col = mesh_device_->num_cols() - 1;
+    const MeshCoordinate victim_coord(last_row, last_col);
+    const MeshCoordinateRange victim_range(victim_coord, victim_coord);
+    const MeshCoordinateRange other_devices(MeshCoordinate(0, 0), MeshCoordinate(last_row, last_col - 1));
     auto& cq = mesh_device_->mesh_command_queue();
     auto* victim = mesh_device_->impl().get_device(victim_coord);
 
-    // Kept clear of the probe workload's circular buffer, which is allocated from the unreserved base.
+    // Program circular buffers start at the unreserved base and grow up, so the flags go just past the probe's.
+    constexpr uint32_t cb_num_pages = 3;
+    constexpr uint32_t cb_page_size = tile_size(tt::DataFormat::Float16_b);
     const uint32_t l1_unreserved_base = victim->allocator()->get_base_allocator_addr(HalMemType::L1);
-    const uint32_t release_addr = l1_unreserved_base + 128 * 1024;
+    const uint32_t release_addr = l1_unreserved_base + cb_num_pages * cb_page_size;
     const uint32_t started_addr = release_addr + sizeof(uint32_t);
 
     const uint32_t kernel_config_base =
         MetalContext::instance().hal().get_dev_addr(HalProgrammableCoreType::TENSIX, HalL1MemAddrType::KERNEL_CONFIG);
     const uint32_t ring_size = l1_unreserved_base - kernel_config_base;
-    // Ring slots are sized by per-core config content, not by how many cores a program covers, so a single core is
-    // enough. Runtime args are the cheapest way to claim a large slot, but Kernel::validate_runtime_args caps them per
-    // kernel. A quarter of the ring per kernel makes the ring itself, rather than the seven-entry launch-message
-    // buffer, the constraint that forces a sync. The parked workload below takes two of these and the fillers one, so
-    // the filler that wraps into the parked workload's region leaves room in it for the probe.
-    constexpr uint32_t max_rt_args_per_kernel = 4094;
+    // Kernel::validate_runtime_args_size caps a Tensix kernel at max_runtime_args_tensix minus two watcher words.
+    constexpr uint32_t max_rt_args_per_kernel = 4096 - 2;
+    // Runtime args are the cheapest way to take up ring space, and a quarter of the ring per kernel makes the ring,
+    // rather than the launch-message slots, run out first.
     const uint32_t rt_args_per_kernel = std::min<uint32_t>(ring_size / 4 / sizeof(uint32_t), max_rt_args_per_kernel);
-    const CoreRangeSet wait_core_set(CoreRange(wait_core, wait_core));
 
-    auto read_words = [&](uint32_t addr, uint32_t num_words) {
-        std::vector<uint32_t> readback;
-        ::tt::tt_metal::detail::ReadFromDeviceL1(victim, wait_core, addr, num_words * sizeof(uint32_t), readback);
-        return readback;
-    };
     auto write_word = [&](uint32_t addr, uint32_t value) {
         std::vector<uint32_t> word = {value};
-        ::tt::tt_metal::detail::WriteToDeviceL1(victim, wait_core, addr, word);
+        ::tt::tt_metal::detail::WriteToDeviceL1(victim, core, addr, word);
+    };
+    // Kernels on one core store their runtime args back to back, so each one added here claims another quarter ring.
+    auto add_padded_kernel =
+        [&](Program& program, const std::string& path, DataMovementProcessor processor, std::vector<uint32_t> args) {
+            args.resize(rt_args_per_kernel, 0);
+            const auto kernel = CreateKernel(
+                program,
+                path,
+                core_set,
+                DataMovementConfig{
+                    .processor = processor,
+                    .noc = processor == DataMovementProcessor::RISCV_0 ? NOC::RISCV_0_default : NOC::RISCV_1_default});
+            SetRuntimeArgs(program, kernel, core_set, args);
+        };
+    auto poll_until = [](std::chrono::seconds timeout, auto&& predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    // Which ring slots the host still considers in use; the checks below use it to confirm the setup worked.
+    auto queued_slots = [&]() {
+        return cq.get_config_buffer_mgr(0).get_queued_entry_indices(
+            MetalContext::instance().hal().get_programmable_core_type_index(HalProgrammableCoreType::TENSIX));
     };
 
-    // Adds another quarter-ring of config footprint to a program.
-    auto add_padding_kernel = [&](Program& program) {
-        const auto kernel = CreateKernel(
-            program,
-            "tests/tt_metal/tt_metal/test_kernels/dataflow/blank.cpp",
-            wait_core_set,
-            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default});
-        SetRuntimeArgs(program, kernel, wait_core_set, std::vector<uint32_t>(rt_args_per_kernel, 0));
-    };
-
-    // The victim's first workload parks its worker until the host releases it.
+    // Holds the victim's worker until the host releases it. Two kernels make it half the ring, so the filler that later
+    // reuses that space covers only half of it and leaves room for the probe.
     Program wait_program;
-    std::vector<uint32_t> wait_args(rt_args_per_kernel, 0);
-    wait_args[0] = release_addr;
-    wait_args[1] = release_value;
-    wait_args[2] = started_addr;
-    wait_args[3] = started_value;
-    const auto wait_kernel = CreateKernel(
+    add_padded_kernel(
         wait_program,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/wait_for_host_l1_write.cpp",
-        wait_core_set,
-        DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
-    SetRuntimeArgs(wait_program, wait_kernel, wait_core_set, wait_args);
-    add_padding_kernel(wait_program);
+        DataMovementProcessor::RISCV_0,
+        {release_addr, release_value, started_addr, started_value});
+    add_padded_kernel(wait_program, blank_kernel, DataMovementProcessor::RISCV_1, {});
     MeshWorkload waiting_workload;
-    waiting_workload.add_program(victim_device, std::move(wait_program));
+    waiting_workload.add_program(victim_range, std::move(wait_program));
 
-    // The victim's second workload is the small config write that must stay fenced: one circular buffer and no runtime
-    // args, so it fits in freed space without needing a sync. The circular buffer is the signature the host looks for.
-    constexpr uint32_t probe_cb_num_pages = 3;
-    constexpr uint32_t probe_cb_page_size = 4096;
-    constexpr uint32_t probe_cb_size = probe_cb_num_pages * probe_cb_page_size;
+    // The probe is the workload whose config would land on the held worker's region: small enough to fit the freed
+    // space without a wait of its own, and its circular buffer is the pattern the host looks for in L1.
     Program probe_program;
     initialize_dummy_circular_buffers(
         probe_program,
-        wait_core_set,
+        core_set,
         {CBConfig{
             .cb_id = 0,
-            .num_pages = probe_cb_num_pages,
-            .page_size = probe_cb_page_size,
+            .num_pages = cb_num_pages,
+            .page_size = cb_page_size,
             .data_format = tt::DataFormat::Float16_b}});
     CreateKernel(
         probe_program,
-        "tests/tt_metal/tt_metal/test_kernels/dataflow/blank.cpp",
-        wait_core_set,
+        blank_kernel,
+        core_set,
         DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
     MeshWorkload probe_workload;
-    probe_workload.add_program(victim_device, std::move(probe_program));
+    probe_workload.add_program(victim_range, std::move(probe_program));
 
-    // Fillers exclude the victim and are half the parked workload's size, so a few of them wrap the ring.
-    std::vector<MeshWorkload> filler_workloads(max_filler_workloads);
-    for (uint32_t i = 0; i < max_filler_workloads; i++) {
+    // Fillers skip the victim and are half the held workload's size, so a few of them use up the ring.
+    std::vector<MeshWorkload> fillers(max_fillers);
+    for (uint32_t i = 0; i < max_fillers; i++) {
         Program filler_program;
-        const auto filler_kernel = CreateKernel(
-            filler_program,
-            "tests/tt_metal/tt_metal/test_kernels/dataflow/blank.cpp",
-            wait_core_set,
-            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
-        SetRuntimeArgs(filler_program, filler_kernel, wait_core_set, std::vector<uint32_t>(rt_args_per_kernel, i + 1));
-        filler_workloads[i].add_program(other_devices, std::move(filler_program));
+        add_padded_kernel(filler_program, blank_kernel, DataMovementProcessor::RISCV_0, {i + 1});
+        fillers[i].add_program(other_devices, std::move(filler_program));
     }
 
-    // The host's view of the ring tells us whether the sequence actually reached the state the bug needs.
-    const uint32_t tensix_buffer_index =
-        MetalContext::instance().hal().get_programmable_core_type_index(HalProgrammableCoreType::TENSIX);
-    auto queued_entries = [&]() { return cq.get_config_buffer_mgr(0).get_queued_entry_indices(tensix_buffer_index); };
-
-    // The geometry this test needs depends on how much ring each workload claims, so report it.
-    auto log_slot = [&](const char* label) {
-        log_info(
-            tt::LogTest,
-            "{} reserved ring offset {}",
-            label,
-            cq.get_config_buffer_mgr(0).get_last_slot_addr(HalProgrammableCoreType::TENSIX) - kernel_config_base);
-    };
-
-    // Warm-up pass: compile and cache everything so the measured pass is pure dispatch. The release flag is pre-armed
-    // so the waiting kernel returns immediately here.
+    // First pass compiles and caches everything, so the real run below is pure dispatch. The release flag is set up
+    // front, so the waiting kernel exits right away here.
     write_word(release_addr, release_value);
-    log_info(tt::LogTest, "Config ring is {} bytes, {} runtime args per kernel", ring_size, rt_args_per_kernel);
     EnqueueMeshWorkload(cq, waiting_workload, false);
-    log_slot("parked workload");
-    for (auto& workload : filler_workloads) {
-        EnqueueMeshWorkload(cq, workload, false);
-        log_slot("filler");
+    for (auto& filler : fillers) {
+        EnqueueMeshWorkload(cq, filler, false);
     }
     EnqueueMeshWorkload(cq, probe_workload, false);
-    log_slot("probe");
     Finish(cq);
 
-    // Entries are only freed lazily, so the warm-up leaves its own entries queued. Reset the host's ring model to a
-    // single satisfied entry, otherwise those stale entries sit ahead of the parked workload below and the fillers
-    // reclaim them instead of ever reaching it.
+    // Slots are only freed once the ring runs out of room, so the first pass leaves its own marked as in use. They
+    // would sit ahead of the held workload and soak up the fillers instead.
     cq.get_config_buffer_mgr(0).mark_completely_full(0);
 
-    // Clear the victim's config ring so any circular buffer signature found later must come from a fresh write.
+    // Zero the ring so any circular buffer pattern seen later must come from a new write.
     std::vector<uint32_t> ring_zeros(ring_size / sizeof(uint32_t), 0);
-    ::tt::tt_metal::detail::WriteToDeviceL1(victim, wait_core, kernel_config_base, ring_zeros);
+    ::tt::tt_metal::detail::WriteToDeviceL1(victim, core, kernel_config_base, ring_zeros);
+
+    // A failed check must still release the worker, or the mesh stays stuck. Running the release twice is harmless.
+    auto release = [&]() {
+        write_word(release_addr, release_value);
+        Finish(cq);
+    };
+    struct ReleaseOnExit {
+        decltype(release)& fn;
+        ~ReleaseOnExit() { fn(); }
+    } release_on_exit{release};
 
     write_word(release_addr, 0);
     write_word(started_addr, 0);
     EnqueueMeshWorkload(cq, waiting_workload, false);
-    const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    bool worker_parked = false;
-    while (!worker_parked && std::chrono::steady_clock::now() < start_deadline) {
-        worker_parked = read_words(started_addr, 1).at(0) == started_value;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    const auto entries_after_hold = queued_entries();
-    auto release_and_finish = [&]() {
-        write_word(release_addr, release_value);
-        Finish(cq);
-    };
-    if (!worker_parked) {
-        release_and_finish();
-        FAIL() << "Victim worker never started";
-    }
-    ASSERT_FALSE(entries_after_hold.empty());
-    const size_t parked_entry = entries_after_hold.back();
+    // The reset above leaves the held workload as the ring's only slot in use.
+    const auto held_slots = queued_slots();
+    ASSERT_EQ(held_slots.size(), 1u) << "Held workload does not own the only ring slot";
+    ASSERT_TRUE(poll_until(std::chrono::seconds(30), [&]() {
+        std::vector<uint32_t> started;
+        ::tt::tt_metal::detail::ReadFromDeviceL1(victim, core, started_addr, sizeof(uint32_t), started);
+        return started.at(0) == started_value;
+    })) << "Victim worker never started";
 
-    // Enqueue fillers until the ring reclaims the parked workload's entry. That free is what hands the covered devices
-    // a worker-completion wait the victim also needs but, before the fix, never received.
-    bool parked_entry_freed = false;
-    for (auto& workload : filler_workloads) {
-        EnqueueMeshWorkload(cq, workload, false);
-        const auto entries = queued_entries();
-        parked_entry_freed = std::find(entries.begin(), entries.end(), parked_entry) == entries.end();
-        if (parked_entry_freed) {
+    // Enqueue fillers until the ring reuses the held slot. From here on the ring considers the victim's region free
+    // even though its worker is still reading that region.
+    bool held_slot_reused = false;
+    for (auto& filler : fillers) {
+        EnqueueMeshWorkload(cq, filler, false);
+        const auto slots = queued_slots();
+        held_slot_reused = std::find(slots.begin(), slots.end(), held_slots.front()) == slots.end();
+        if (held_slot_reused) {
             break;
         }
     }
-    if (!parked_entry_freed) {
-        release_and_finish();
-        FAIL() << "Ring never freed the parked workload's entry after " << max_filler_workloads << " fillers; ring is "
-               << ring_size << " bytes from " << kernel_config_base << " and reached "
-               << cq.get_config_buffer_mgr(0).get_last_slot_addr(HalProgrammableCoreType::TENSIX);
-    }
+    ASSERT_TRUE(held_slot_reused) << "Ring never reused the held slot after " << max_fillers << " fillers; ring is "
+                                  << ring_size << " bytes from " << kernel_config_base << " and reached "
+                                  << cq.get_config_buffer_mgr(0).get_last_slot_addr(HalProgrammableCoreType::TENSIX);
 
-    // The probe must reuse that freed space without a sync of its own, otherwise its own wait would fence the write and
-    // hide a missing wait. A sync would have freed queued entries instead of only adding the probe's.
-    const size_t queued_before_probe = queued_entries().size();
+    // The probe must fit the freed space without a wait of its own, since such a wait would hold its write back for
+    // reasons of its own. A wait frees slots, so only the probe's slot may appear.
+    const size_t slots_before_probe = queued_slots().size();
     EnqueueMeshWorkload(cq, probe_workload, false);
-    if (queued_entries().size() != queued_before_probe + 1) {
-        release_and_finish();
-        FAIL() << "Probe workload reserved with a sync of its own, so this sequence cannot observe a missing wait";
-    }
-    const uint32_t probe_cb_base = probe_workload.get_cb_base_addr(mesh_device_, wait_core, CoreType::WORKER);
+    ASSERT_EQ(queued_slots().size(), slots_before_probe + 1)
+        << "Probe reserved with a wait of its own, so this run cannot show the missing wait";
 
+    const uint32_t probe_cb_base = probe_workload.get_cb_base_addr(mesh_device_, core, CoreType::WORKER);
     auto probe_config_written = [&]() {
-        const auto words = read_words(probe_cb_base, UINT32_WORDS_PER_LOCAL_CIRCULAR_BUFFER_CONFIG);
-        return words.at(1) == probe_cb_size && words.at(2) == probe_cb_num_pages;
+        std::vector<uint32_t> cb_config;
+        ::tt::tt_metal::detail::ReadFromDeviceL1(
+            victim, core, probe_cb_base, UINT32_WORDS_PER_LOCAL_CIRCULAR_BUFFER_CONFIG * sizeof(uint32_t), cb_config);
+        return cb_config.at(1) == cb_num_pages * cb_page_size && cb_config.at(2) == cb_num_pages;
     };
 
-    // The sync that freed the ring space cannot retire while the workers are parked, so the probe's config must not
-    // land yet. Release the workers before asserting, otherwise a failure would leave the mesh wedged.
-    const auto fence_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    bool config_written_while_parked = false;
-    while (!config_written_while_parked && std::chrono::steady_clock::now() < fence_deadline) {
-        config_written_while_parked = probe_config_written();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    // The held worker is still reading this region, so nothing may write kernel config over it.
+    const bool written_while_held = poll_until(std::chrono::seconds(2), probe_config_written);
+    release();
 
-    release_and_finish();
-
-    EXPECT_FALSE(config_written_while_parked)
-        << "Kernel config was written to a device that never received the wait freeing that ring space";
-    // Confirms the check above was reading the right place rather than passing vacuously.
+    EXPECT_FALSE(written_while_held) << "Kernel config overwrote a region a busy worker was still reading";
+    // The config does land once the worker is released, so the check above read the right address.
     EXPECT_TRUE(probe_config_written());
 }
 
