@@ -6,26 +6,22 @@
 
 #include <fmt/format.h>
 
-#include <cstdint>
+#include <tt-metalium/host_api.hpp>
 #include <tt-metalium/mesh_coord.hpp>
-#include <tt-metalium/system_mesh.hpp>
 
 namespace ttml::test_utils {
 
-// True when the devices visible to this host can host `shape`. A 1x2 mesh, for instance, is
-// all of an N300 but also a slice of a T3K or a Blackhole tray, so tests that need one gate
-// on the mesh being available rather than on a specific board type.
+// True when this host has enough chips for `shape`. A 1x2 mesh, for instance, is all of an
+// N300 but also a slice of a T3K or a Blackhole tray, so tests that need one gate on the
+// devices being there rather than on a specific board type.
+//
+// Deliberately counts chips instead of comparing against SystemMesh::local_shape(): the
+// system mesh reflects the mesh graph descriptor currently installed on the control plane,
+// so once any test opens a 1x2 mesh it reports 1x2 for the rest of the process and a later
+// test wanting a bigger mesh would skip itself on a host that can host it. A host that has
+// the chips but can't form the mesh should fail loudly in the open, not skip.
 inline bool system_supports_mesh(const tt::tt_metal::distributed::MeshShape& shape) {
-    const auto& system_shape = tt::tt_metal::distributed::SystemMesh::instance().local_shape();
-    if (system_shape.dims() < shape.dims()) {
-        return false;
-    }
-    for (int32_t dim = 0; dim < static_cast<int32_t>(shape.dims()); ++dim) {
-        if (system_shape[dim] < shape[dim]) {
-            return false;
-        }
-    }
-    return true;
+    return tt::tt_metal::GetNumAvailableDevices() >= shape.mesh_size();
 }
 
 }  // namespace ttml::test_utils

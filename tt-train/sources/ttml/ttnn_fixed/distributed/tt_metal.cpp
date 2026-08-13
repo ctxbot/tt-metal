@@ -13,6 +13,7 @@
 #include <tt-metalium/experimental/fabric/mesh_graph_descriptor.hpp>
 
 #include "tt-metalium/experimental/fabric/fabric.hpp"
+#include "tt_metal/impl/context/metal_context.hpp"
 
 namespace ttml::ttnn_fixed::distributed {
 
@@ -97,13 +98,24 @@ std::optional<std::string> get_mgd_path(uint32_t num_devices) {
 void enable_fabric(uint32_t num_devices) {
     auto mgd_path = get_mgd_path(num_devices);
 
+    // Hand the descriptor to the control plane explicitly rather than leaving it to
+    // TT_MESH_GRAPH_DESC_PATH. That variable is read once, when rtoptions is first
+    // constructed, so anything that touches the fabric layer before this point -- an
+    // earlier mesh in the same process, or a bare SystemMesh query -- pins the control
+    // plane to whatever descriptor was current back then. The fabric then comes up on
+    // links that don't exist in the mesh being opened and the routers sit in a remote
+    // handshake until they time out. Reinstalling here makes the open independent of
+    // what the process did before it.
     if (mgd_path.has_value()) {
+        tt::tt_metal::MetalContext::instance().set_custom_fabric_topology(mgd_path.value(), {});
+
         // Infer the fabric config from the MGD's dim_types (LINE vs RING per axis)
         // This automatically selects FABRIC_2D, FABRIC_2D_TORUS_X, FABRIC_2D_TORUS_Y, or FABRIC_2D_TORUS_XY
         auto fabric_config = infer_fabric_config_from_mgd(mgd_path.value());
         tt::tt_fabric::SetFabricConfig(fabric_config);
     } else {
-        // No MGD available, use default FABRIC_2D
+        // No MGD available, use default FABRIC_2D over the auto-discovered topology.
+        tt::tt_metal::MetalContext::instance().set_default_fabric_topology();
         tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::FABRIC_2D);
     }
 }

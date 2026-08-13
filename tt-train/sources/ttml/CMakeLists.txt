@@ -313,6 +313,13 @@ target_link_libraries(
         FlatBuffers::FlatBuffers
 )
 
+# ttnn_fixed/distributed installs a custom mesh graph descriptor through MetalContext,
+# which sits outside the public tt-metalium API and includes its neighbours by paths
+# relative to tt_metal/. Same escape hatch the tt-train benchmarks use.
+if(TARGET Metalium::Metal)
+    target_include_directories(ttml PRIVATE "$<TARGET_PROPERTY:Metalium::Metal,INCLUDE_DIRECTORIES>")
+endif()
+
 # Add include directory for TTNN::Core's generated flatbuffer headers
 # These are needed because tensor_flatbuffer.hpp includes tensor_generated.h
 if(TARGET TTNN::Core)
