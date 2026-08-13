@@ -2,9 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-/*
- * This kernel computes distributed rmsnorm statistics: E(x**2).
- */
+// Produces one E[x^2] tile per row; the scalar statistic occupies the leftmost column.
 
 #include <cstdint>
 
@@ -98,6 +96,7 @@ void kernel_main() {
     }
 
 #ifdef IS_MERGE_CORE
+    // Merge cores sum the column's partial statistics into out_final.
     if constexpr (unpack_fp32_active) {
         DataflowBuffer dfb_x2_merge(dfb::x2_merge);
         DataflowBuffer dfb_out_final(dfb::out_final);

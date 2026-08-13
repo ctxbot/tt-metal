@@ -2,9 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-/*
- * This kernel computes layernorm statistics: E(x**2) and E(x).
- */
+// Produces two tiles per row in this order: E[x^2], then E[x]. Each scalar statistic
+// occupies the leftmost column of its tile.
 
 #include <cstdint>
 
@@ -82,6 +81,7 @@ void kernel_main() {
                 ckl::output(dfb::x2, ckl::ReservePolicy::PerBlockSize, ckl::PushPolicy::PerBlockSize)>(squaring_shape);
         }
 
+        // First output: E[x^2].
         compute_kernel_lib::reduce<
             reduce_type,
             ReduceDim::REDUCE_ROW,
@@ -92,11 +92,7 @@ void kernel_main() {
             compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT_AND_OUTPUT,
             reduce_fp32_mode>(compute_kernel_lib::ReduceInputBlockShape::row(Wt));
 
-        /*
-         * sum(x)
-         */
-        // BulkWaitBulkPop: All Wt tiles already in the buffer (see cumulative wait above)
-        // Bulk mode for optimal performance
+        // Second output: E[x].
         compute_kernel_lib::reduce<
             reduce_type,
             ReduceDim::REDUCE_ROW,
