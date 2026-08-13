@@ -172,7 +172,7 @@ void run_pack_relu_test(
     };
     experimental::SetProgramRunArgs(program, params);
 
-    LaunchProgram(mesh_device, std::move(program));
+    slow_dispatch::LaunchProgram(mesh_device, program, /*wait_until_cores_done=*/true);
 
     std::vector<uint32_t> result_vec;
     slow_dispatch::ReadFromBuffer(*dst_dram_buffer, result_vec);

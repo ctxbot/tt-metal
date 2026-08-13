@@ -333,7 +333,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, BmmMultinode) {
     slow_dispatch::WriteToBuffer(tensors.src0.mesh_buffer(), src0_vec);
     slow_dispatch::WriteToBuffer(tensors.src1.mesh_buffer(), src1_vec);
 
-    LaunchProgram(this->device(), std::move(program));
+    slow_dispatch::LaunchProgram(this->device(), program, /*wait_until_cores_done=*/true);
 
     std::vector<uint32_t> result_vec;
     slow_dispatch::ReadFromBuffer(tensors.dst.mesh_buffer(), result_vec);

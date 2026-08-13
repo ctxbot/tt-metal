@@ -179,7 +179,7 @@ static vector<uint32_t> run_mxfp4_typecast(
     };
     experimental::SetProgramRunArgs(program, params);
 
-    LaunchProgram(mesh_device, std::move(program));
+    slow_dispatch::LaunchProgram(mesh_device, program, /*wait_until_cores_done=*/true);
 
     vector<uint32_t> result_vec;
     slow_dispatch::ReadFromBuffer(*dst_buffer, result_vec);

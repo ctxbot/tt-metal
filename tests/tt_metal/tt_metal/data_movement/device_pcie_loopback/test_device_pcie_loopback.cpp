@@ -129,7 +129,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, HostHugepagePcieLoopback) {
     };
     Program program = experimental::MakeProgramFromSpec(this->device(), spec);
 
-    LaunchProgram(this->device(), std::move(program));
+    slow_dispatch::LaunchProgram(this->device(), program, /*wait_until_cores_done=*/true);
 
     // Step 5: Host verifies dst hugepage region matches src.
     std::vector<uint32_t> host_dst_readback(expected.size());

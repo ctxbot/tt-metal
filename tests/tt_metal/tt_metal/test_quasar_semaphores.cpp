@@ -146,7 +146,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarMultiSemaphorePipeline) {
     };
     experimental::SetProgramRunArgs(program, params);
 
-    LaunchProgram(this->device(), std::move(program));
+    slow_dispatch::LaunchProgram(this->device(), program, /*wait_until_cores_done=*/true);
 
     std::vector<uint32_t> actual_data(num_elements, 0);
     slow_dispatch::ReadFromDRAMChannel(this->device(), 0, dram_dst_addr, num_elements * sizeof(uint32_t), actual_data);
@@ -357,7 +357,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarMultipleClustersMultiSemaphorePi
     };
     experimental::SetProgramRunArgs(program, params);
 
-    LaunchProgram(this->device(), std::move(program));
+    slow_dispatch::LaunchProgram(this->device(), program, /*wait_until_cores_done=*/true);
 
     std::vector<uint32_t> actual_data(num_elements, 0);
     slow_dispatch::ReadFromDRAMChannel(this->device(), 0, dram_dst_addr, num_elements * sizeof(uint32_t), actual_data);

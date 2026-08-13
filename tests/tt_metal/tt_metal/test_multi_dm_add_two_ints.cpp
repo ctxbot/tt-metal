@@ -111,7 +111,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, MultiDmAddTwoInts) {
     };
     experimental::SetProgramRunArgs(program, params);
 
-    LaunchProgram(this->device(), std::move(program));
+    slow_dispatch::LaunchProgram(this->device(), program, /*wait_until_cores_done=*/true);
 
     std::vector<uint32_t> result_core_0(3, 0);
     slow_dispatch::ReadFromL1(this->device(), CoreCoord(0, 0), result_base, sizeof(uint32_t) * 3, result_core_0);

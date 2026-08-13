@@ -119,7 +119,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, GlobalsAndTLS) {
     params.kernel_run_args = {kra1, kra2, kra3};
     experimental::SetProgramRunArgs(program, params);
 
-    LaunchProgram(this->device(), std::move(program));
+    slow_dispatch::LaunchProgram(this->device(), program, /*wait_until_cores_done=*/true);
 
     std::vector<uint32_t> dram_data;
     slow_dispatch::ReadFromDRAMChannel(this->device(), dram_channel, dram_address, TOTAL_RESULT_BYTES, dram_data);
@@ -332,7 +332,7 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarComputeKernelTLS) {
     }};
     experimental::SetProgramRunArgs(program, params);
 
-    LaunchProgram(this->device(), std::move(program));
+    slow_dispatch::LaunchProgram(this->device(), program, /*wait_until_cores_done=*/true);
 
     std::vector<uint32_t> l1_data;
     slow_dispatch::ReadFromL1(this->device(), core, l1_result_addr, total_result_bytes, l1_data, CoreType::WORKER);
