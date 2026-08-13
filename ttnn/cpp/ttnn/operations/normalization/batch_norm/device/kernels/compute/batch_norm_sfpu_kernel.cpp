@@ -12,48 +12,6 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "experimental/kernel_args.h"
 
-// out = ((input - batch_mean) / sqrt(batch_var + eps)) * optional(weight) + optional(bias).
-// The writer-facing output DFB is only bound when the accumulation format is wider than the output
-// dtype; on the other path the writer drains the compute output directly, so the same kernel-side
-// handle has to name a different DFB. The alias is gated at the preprocessor stage because
-// dfb::writer_out simply does not exist on the untypecast build.
-#ifdef NEEDS_OUTPUT_TYPECAST
-constexpr bool needs_output_typecast = true;
-constexpr auto dfb_output_final_binding = dfb::writer_out;
-#else
-constexpr bool needs_output_typecast = false;
-constexpr auto dfb_output_final_binding = dfb::out;
-#endif
-
-template <bool WeightHas, bool BiasHas, bool NeedsTypecast, uint32_t TcInFmt, uint32_t TcOutFmt>
-ALWI void batchnorm_bcast_tiles(uint32_t freq, uint32_t tile_start) {
-    using namespace compute_kernel_lib;
-
-    eltwise_chain(
-        IterationShape::one_tile(),
-        CopyTile<input(dfb::batch_var, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D0>{},
-        CopyTile<input(dfb::eps, WaitPolicy::None, PopPolicy::None), Dst::D1>{},
-        AddBinary<Dst::D0, Dst::D1, Dst::D0>{},
-        Rsqrt<>{},
-        PackTile<output(dfb::den)>{});
-
-    const uint32_t inner_count = freq - tile_start;
-
-    eltwise_chain(
-        IterationShape::tiles(inner_count),
-        CopyTile<input(dfb::input)>{},
-        CopyTile<input(dfb::batch_mean, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>{},
-        SubBinary<Dst::D0, Dst::D1, Dst::D0>{},
-        CopyTile<input(dfb::den, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>{},
-        MulBinary<Dst::D0, Dst::D1, Dst::D0>{},
-        Optional<WeightHas, CopyTile<input(dfb::weight, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>>{},
-        Optional<WeightHas, MulBinary<Dst::D0, Dst::D1, Dst::D0>>{},
-        Optional<BiasHas, CopyTile<input(dfb::bias, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>>{},
-        Optional<BiasHas, AddBinary<Dst::D0, Dst::D1, Dst::D0>>{},
-        Optional<NeedsTypecast, Typecast<TcInFmt, TcOutFmt, Dst::D0>>{},
-        PackTile<output(dfb_output_final_binding)>{});
-}
-
 void kernel_main() {
     uint32_t num_tiles = get_arg(args::num_tiles);
     uint32_t tile_freq = get_arg(args::tile_freq);
@@ -67,6 +25,11 @@ void kernel_main() {
 
     constexpr uint32_t tc_in_fmt = get_arg(args::tc_in_fmt);
     constexpr uint32_t tc_out_fmt = get_arg(args::tc_out_fmt);
+#ifdef NEEDS_OUTPUT_TYPECAST
+    constexpr bool needs_output_typecast = true;
+#else
+    constexpr bool needs_output_typecast = false;
+#endif
 
     compute_kernel_hw_startup(dfb::input, dfb::batch_mean, dfb::out);
 
@@ -75,13 +38,49 @@ void kernel_main() {
     const uint32_t complete_iterations = (num_tiles + tile_start) / tile_freq;
     const uint32_t remaining_iterations = (num_tiles + tile_start) % tile_freq;
 
+    // out = ((input - batch_mean) / sqrt(batch_var + eps)) * optional(weight) + optional(bias).
+    const auto batchnorm_bcast_tiles = [](uint32_t freq, uint32_t tile_start) __attribute__((always_inline)) {
+        using namespace compute_kernel_lib;
+
+        eltwise_chain(
+            IterationShape::one_tile(),
+            CopyTile<input(dfb::batch_var, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D0>{},
+            CopyTile<input(dfb::eps, WaitPolicy::None, PopPolicy::None), Dst::D1>{},
+            AddBinary<Dst::D0, Dst::D1, Dst::D0>{},
+            Rsqrt<>{},
+            PackTile<output(dfb::den)>{});
+
+        const uint32_t inner_count = freq - tile_start;
+
+        // The output binding must be selected by the preprocessor: dfb::writer_out is not generated for
+        // non-typecast builds, so even an unselected if-constexpr or ternary branch would fail to compile.
+        // Keep this condition in sync with needs_output_typecast above; the writer drains out otherwise.
+#ifdef NEEDS_OUTPUT_TYPECAST
+        constexpr auto output_final = output(dfb::writer_out);
+#else
+        constexpr auto output_final = output(dfb::out);
+#endif
+
+        eltwise_chain(
+            IterationShape::tiles(inner_count),
+            CopyTile<input(dfb::input)>{},
+            CopyTile<input(dfb::batch_mean, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>{},
+            SubBinary<Dst::D0, Dst::D1, Dst::D0>{},
+            CopyTile<input(dfb::den, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>{},
+            MulBinary<Dst::D0, Dst::D1, Dst::D0>{},
+            Optional<weight_has_value, CopyTile<input(dfb::weight, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>>{},
+            Optional<weight_has_value, MulBinary<Dst::D0, Dst::D1, Dst::D0>>{},
+            Optional<bias_has_value, CopyTile<input(dfb::bias, WaitPolicy::Upfront, PopPolicy::AtEnd), Dst::D1>>{},
+            Optional<bias_has_value, AddBinary<Dst::D0, Dst::D1, Dst::D0>>{},
+            Optional<needs_output_typecast, Typecast<tc_in_fmt, tc_out_fmt, Dst::D0>>{},
+            PackTile<output_final>{});
+    };
+
     for (uint32_t i = 0; i < complete_iterations; ++i, tile_start = 0) {
-        batchnorm_bcast_tiles<weight_has_value, bias_has_value, needs_output_typecast, tc_in_fmt, tc_out_fmt>(
-            tile_freq, tile_start);
+        batchnorm_bcast_tiles(tile_freq, tile_start);
     }
     if (remaining_iterations > 0) {
-        batchnorm_bcast_tiles<weight_has_value, bias_has_value, needs_output_typecast, tc_in_fmt, tc_out_fmt>(
-            remaining_iterations, tile_start);
+        batchnorm_bcast_tiles(remaining_iterations, tile_start);
     }
 
     DataflowBuffer(dfb::eps).pop_front(1);
