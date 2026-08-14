@@ -17,30 +17,12 @@ struct MultiDeviceGlobalSemaphore {
     auto attribute_values() const { return std::forward_as_tuple(this->global_semaphores); }
 };
 
-// Single Device Creation API
-GlobalSemaphore create_global_semaphore(
-    IDevice* device, const CoreRangeSet& cores, uint32_t initial_value, BufferType buffer_type = BufferType::L1);
-
 // MeshDevice Creation API
 GlobalSemaphore create_global_semaphore(
     MeshDevice* mesh_device,
     const CoreRangeSet& cores,
     uint32_t initial_value,
     BufferType buffer_type = BufferType::L1);
-
-// Multi-device Creation API
-MultiDeviceGlobalSemaphore create_global_semaphore(
-    const std::vector<IDevice*>& devices,
-    const CoreRangeSet& cores,
-    uint32_t initial_value,
-    BufferType buffer_type = BufferType::L1);
-MultiDeviceGlobalSemaphore create_global_semaphore_with_same_address(
-    const std::vector<IDevice*>& devices,
-    const CoreRangeSet& cores,
-    uint32_t initial_value,
-    BufferType buffer_type,
-    uint32_t attempts,
-    bool search_max = false);
 
 tt::tt_metal::DeviceAddr get_global_semaphore_address(const GlobalSemaphore& global_semaphore);
 std::vector<tt::tt_metal::DeviceAddr> get_global_semaphore_address(const MultiDeviceGlobalSemaphore& global_semaphore);
