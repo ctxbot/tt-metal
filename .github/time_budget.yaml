@@ -341,7 +341,7 @@ models:
   # Per-tier e2e budgets, consumed by the tiered model pipelines;
   # The plain `e2e` key is used for the non-tiered pipelines (blackhole-e2e, t3000-e2e).
   e2e_tier1:
-    wh_n150: 31
+    wh_n150: 32
     wh_galaxy_perf: 120
     bh_p150: 27
     bh_quietbox_2: 245
