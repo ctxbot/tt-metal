@@ -26,6 +26,9 @@ env:
   TTNOP_THREADS: unpack,math
   TTNOP_SITE_MODE: sync
   TTNOP_DELAYS: 1-100
+  # Freeze the stimuli and report any variant whose output moves off the baseline,
+  # including the ones the suite's own PCC floor still passes.
+  TTNOP_DRIFT: "1"
 
 jobs:
   build-images:
