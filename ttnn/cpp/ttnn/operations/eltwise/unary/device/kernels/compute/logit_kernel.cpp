@@ -26,8 +26,8 @@ void kernel_main() {
 
     compute_kernel_hw_startup(dfb_input_id, dfb_tmp0_id);
 
-    // The temporary DFB is intentionally small. Produce and consume one temporary tile at a time
-    // so the producer cannot fill it while waiting for the second stage to start.
+    // The temporary DFB holds only two tiles, and this kernel is both its producer and consumer.
+    // Produce and consume one tile at a time: separating the two stages deadlocks once the producer fills the DFB.
     for (uint32_t tile = 0; tile < num_tiles; ++tile) {
         ckl::eltwise_chain(
             ckl::IterationShape::one_tile(),

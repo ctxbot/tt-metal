@@ -1927,7 +1927,10 @@ def test_unary_hardswish_ttnn(input_shapes, low, high, torch_dtype, ttnn_dtype, 
 @pytest.mark.parametrize("torch_dtype,ttnn_dtype", [(torch.int32, ttnn.int32), (torch.uint32, ttnn.uint32)])
 def test_unary_hardswish_integer_releases_every_input_tile(torch_dtype, ttnn_dtype, device):
     """The integer path is hardsigmoid-only, but must still pop all input pages across a multi-tile tensor."""
-    input_data = torch.zeros((1, 1, 32, 96), dtype=torch_dtype)
+    grid = device.compute_with_storage_grid_size()
+    # The input CB holds two tiles. Give at least one worker three tiles so a missing pop blocks its reader.
+    num_tiles = 2 * grid.x * grid.y + 1
+    input_data = torch.zeros((1, 1, 32, 32 * num_tiles), dtype=torch_dtype)
     input_tensor = ttnn.from_torch(input_data, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
 
     output = ttnn.to_torch(ttnn.hardswish(input_tensor), dtype=torch_dtype)
@@ -2759,6 +2762,20 @@ def test_unary_logit_edge_cases(input_shape, torch_dtype, ttnn_dtype, device, ep
             assert_with_ulp(output_tensor[finite_mask], golden_tensor[finite_mask], ulp_threshold=1)
     else:
         assert torch.allclose(output_tensor, golden_tensor, equal_nan=True, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("eps", [None, 0.25])
+def test_unary_logit_streams_temporary_tiles(device, eps):
+    grid = device.compute_with_storage_grid_size()
+    # The temporary CB holds two tiles. Give at least one worker three tiles to exercise producer/consumer streaming.
+    num_tiles = 2 * grid.x * grid.y + 1
+    in_data = torch.full((1, 1, 32, 32 * num_tiles), 0.5, dtype=torch.bfloat16)
+    input_tensor = ttnn.from_torch(in_data, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+    output_tensor = ttnn.to_torch(ttnn.logit(input_tensor, eps=eps))
+    golden_tensor = ttnn.get_golden_function(ttnn.logit)(in_data, eps=eps)
+
+    assert_with_ulp(output_tensor, golden_tensor, ulp_threshold=1)
 
 
 @pytest.mark.parametrize(

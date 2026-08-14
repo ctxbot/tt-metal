@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Produces one E[x^2] tile per row; the scalar statistic occupies the leftmost column.
+// RMSNorm-only 2D path: every core produces a partial sum(x^2) tile; merge cores additionally combine
+// their column's partials into the final statistic. Each output tile carries its per-row statistics in column 0.
 
 #include <cstdint>
 
@@ -24,7 +25,8 @@
 namespace ckl = compute_kernel_lib;
 
 // The statistics pass reads either the raw input or the fused a + b result, depending on whether a
-// residual was supplied. Only the buffer selected here is bound on this build.
+// residual was supplied. Only the buffer selected here is bound on this build, so naming the other
+// handle would not compile even in a discarded C++ branch.
 #ifdef FUSE_PRE_ADD
 constexpr auto dfb_inp_id = dfb::fused;
 #else
@@ -96,7 +98,7 @@ void kernel_main() {
     }
 
 #ifdef IS_MERGE_CORE
-    // Merge cores sum the column's partial statistics into out_final.
+    // Only merge-core builds bind out_final, so this block must be selected by the preprocessor.
     if constexpr (unpack_fp32_active) {
         DataflowBuffer dfb_x2_merge(dfb::x2_merge);
         DataflowBuffer dfb_out_final(dfb::out_final);

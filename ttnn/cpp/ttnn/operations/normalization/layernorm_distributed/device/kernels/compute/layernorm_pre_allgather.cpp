@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Produces two tiles per row in this order: E[x^2], then E[x]. Each scalar statistic
-// occupies the leftmost column of its tile.
+// Produces two tiles per tile-row in this order: sum(x^2), then sum(x). The per-row statistics
+// occupy column 0 of each tile.
 
 #include <cstdint>
 
@@ -81,7 +81,7 @@ void kernel_main() {
                 ckl::output(dfb::x2, ckl::ReservePolicy::PerBlockSize, ckl::PushPolicy::PerBlockSize)>(squaring_shape);
         }
 
-        // First output: E[x^2].
+        // First output: sum(x^2) for the tile-row.
         compute_kernel_lib::reduce<
             reduce_type,
             ReduceDim::REDUCE_ROW,
@@ -92,7 +92,8 @@ void kernel_main() {
             compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT_AND_OUTPUT,
             reduce_fp32_mode>(compute_kernel_lib::ReduceInputBlockShape::row(Wt));
 
-        // Second output: E[x].
+        // Second output: sum(x) for the tile-row. The square stage above waited cumulatively but
+        // popped nothing, so all Wt input tiles are already resident and this reduce drains them in bulk.
         compute_kernel_lib::reduce<
             reduce_type,
             ReduceDim::REDUCE_ROW,
