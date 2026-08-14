@@ -201,3 +201,27 @@ def test_split_negative_dim_with_split_sizes_list(device, layout, dtype):
             output.shape == torch_result.shape
         ), f"Output shape {output.shape} does not match torch shape {torch_result.shape}"
         assert_with_pcc(torch_result, output, 0.9999)
+
+
+# 2nd same-shape TILE split must re-patch the reader input address on cache hit.
+def test_split_tile_cache_hit_reader_address(device):
+    shape = (1, 1, 32, 128256)
+    split_size = 64128
+    dim = 3
+
+    torch_a = torch.rand(shape, dtype=torch.bfloat16)
+    torch_b = torch.rand(shape, dtype=torch.bfloat16)
+
+    tt_a = ttnn.from_torch(torch_a, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    tt_b = ttnn.from_torch(torch_b, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+
+    entries_after_first = None
+    for tt_in, torch_in in ((tt_a, torch_a), (tt_b, torch_b)):
+        outputs = ttnn.split(tt_in, split_size, dim=dim)
+        for exp, got in zip(torch.split(torch_in, split_size, dim=dim), outputs):
+            assert_with_pcc(exp, ttnn.to_torch(got), 0.999)
+        # 2nd call must reuse the 1st's cache entries.
+        if entries_after_first is None:
+            entries_after_first = device.num_program_cache_entries()
+        else:
+            assert device.num_program_cache_entries() == entries_after_first
