@@ -241,6 +241,13 @@ AllGatherDeviceOperation::program_factory_t AllGatherDeviceOperation::select_pro
         // Decide between multicast or unicast algorithm
         const auto& input_tensor = tensor_args.input_tensor;
         const uint32_t axis = args.get_1d_axis();
+        // Fabric2D rings require routed traffic for the wrap edge. The multicast factory's barrier
+        // assumes a non-wrapping axis range; on both physically straight and folded logical rings it
+        // can leave peers unsignalled. Explicit routed unicasts handle both embeddings correctly.
+        if (tt::tt_fabric::is_2d_fabric_config(args.fabric_config) &&
+            tt::tt_fabric::is_ring_or_torus(args.axis_topology[axis])) {
+            return program_factory_t{AllGatherUnicastFactory{}};
+        }
         switch (input_tensor.device()->arch()) {
             case tt::ARCH::WORMHOLE_B0: {
                 const uint64_t num_pages = input_tensor.buffer()->num_pages();       // per-device shard
