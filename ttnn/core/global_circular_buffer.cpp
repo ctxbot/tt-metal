@@ -31,8 +31,8 @@ GlobalCircularBuffer create_global_circular_buffer(
     const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping,
     uint32_t size,
     BufferType buffer_type) {
-    return tt::tt_metal::experimental::CreateGlobalCircularBuffer(
-        device, sender_receiver_core_mapping, size, buffer_type);
+    TT_FATAL(device != nullptr, "MeshDevice cannot be null");
+    return tt::tt_metal::experimental::GlobalCircularBuffer(*device, sender_receiver_core_mapping, size, buffer_type);
 }
 
 GlobalCircularBuffer create_global_circular_buffer_for_tensor_prefetcher(
