@@ -225,7 +225,7 @@ TEST(RealtimeProfilerStress, PeakLoadPreservesRecords) {
     std::this_thread::sleep_for(kPostQuiesceDrain);
     const uint32_t peak_fifo_pages = rt->peak_fifo_pages();
     const uint32_t fifo_capacity_pages = rt->host_fifo_capacity_pages();
-    const uint32_t ring_full_waits = rt->ring_full_wait_count();
+    const uint32_t transport_drops = rt->transport_drop_count();
     const uint64_t published_batches = rt->num_published_batches();
     const double mean_publish_batch =
         published_batches ? static_cast<double>(rt->num_published_records()) / published_batches : 0.0;
@@ -238,7 +238,7 @@ TEST(RealtimeProfilerStress, PeakLoadPreservesRecords) {
     log_info(
         tt::LogTest,
         "[RT profiler stress] {} stress records across {} active device(s) over {} replays, max_callback_batch={}, "
-        "mean_publish_batch={:.1f}, peak_fifo={}/{} pages, ring_full_waits={}, {} startup-race skips, {} "
+        "mean_publish_batch={:.1f}, peak_fifo={}/{} pages, transport_drops={}, {} startup-race skips, {} "
         "large-negative-delta skips (worst delta = {} cycles), {} bad-frequency, {} implausible-duration",
         stress_records,
         num_active_devices,
@@ -247,7 +247,7 @@ TEST(RealtimeProfilerStress, PeakLoadPreservesRecords) {
         mean_publish_batch,
         peak_fifo_pages,
         fifo_capacity_pages,
-        ring_full_waits,
+        transport_drops,
         startup_race_skips,
         large_negative_skips,
         worst_negative_delta,
@@ -262,7 +262,7 @@ TEST(RealtimeProfilerStress, PeakLoadPreservesRecords) {
     EXPECT_LT(peak_fifo_pages, fifo_capacity_pages)
         << "host D2H FIFO reached capacity; the receiver drained it slower than the device filled it";
 
-    EXPECT_EQ(ring_full_waits, 0u)
+    EXPECT_EQ(transport_drops, 0u)
         << "device ring reached capacity; the receiver drained it slower than the device filled it";
 
     const uint64_t max_allowed_large_negative =

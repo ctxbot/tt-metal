@@ -54,8 +54,8 @@ struct RtProfilerRingBuffer {
     volatile uint32_t write_index;  // incremented by BRISC after writing an entry
     volatile uint32_t read_index;   // incremented by NCRISC after pushing an entry
     volatile uint32_t terminate;    // set by BRISC to tell NCRISC to drain and exit
-    // BRISC (cq_realtime_profiler): incremented once per enqueue attempt blocked on a full ring
-    volatile uint32_t ring_full_wait_count;
+    // BRISC (cq_realtime_profiler): intervals discarded because the ring was full.
+    volatile uint32_t transport_drop_count;
     RtProfilerNcriscDebug ncrisc_debug;
     uint8_t data[RT_PROFILER_RING_CAPACITY][RT_PROFILER_ENTRY_SIZE];
 };

@@ -6,9 +6,10 @@ This is the Milestone 0 decision record for
 `REALTIME_PROFILER_CONCURRENT_SUBDEVICE_REDESIGN_PLAN.md`.
 
 The protocol applies only to the Blackhole, single-command-queue,
-worker-dispatch path. It does not define model integration, operation core
-allocation, Wormhole behavior, Quasar behavior, multi-CQ behavior, trace replay,
-or remote-chip transport.
+worker-dispatch path. For this feature the profiler eligibility gate rejects
+Wormhole and Quasar rather than preserving the old single-stream profiler on
+those architectures. It does not define model integration, operation core
+allocation, multi-CQ behavior, trace replay, or remote-chip transport.
 
 ## Current-path evidence
 
@@ -51,7 +52,10 @@ The host already calculates the exact per-launch completion contribution as
 `num_workers` in `FDMeshCommandQueue::enqueue_mesh_workload()`. Milestone 1 will
 carry that value as an eight-bit `profiler_num_workers` field in
 `CQDispatchGoSignalMcastCmd`. Blackhole's maximum Tensix plus virtual ETH worker
-count fits in eight bits and the host must assert that before encoding it.
+count normally fits in eight bits. A larger count is encoded as zero so the
+application still runs, emits one host warning per process, and is attributed
+to `unsupported_launch_drop_count` rather than silently folded into another
+loss category.
 
 The command remains 16 bytes by narrowing `wait_stream` from 16 bits to 8 bits;
 the dispatch stream index is bounded well below 256 by the hardware stream
@@ -75,12 +79,12 @@ half-range modular greater-than-or-equal comparison. A natural transition from
 any descriptor or watermark. Each per-launch advance is at most 255, far below
 the half-range ambiguity boundary.
 
-The virtualized-ETH workaround currently injects its synthetic completion delta
-into `first_stream_used`. Concurrent profiling is enabled for such a launch only
-when `wait_stream == first_stream_used`; otherwise dispatch_s counts the launch
-as unsupported profiler loss and does not publish a descriptor. This guard
-prevents a profiler descriptor from waiting on a target that the selected stream
-cannot reach. It does not change the dispatch workaround itself.
+The virtualized-ETH workaround injects synthetic completion deltas into
+`first_stream_used`, which can satisfy an unrelated first-stream descriptor
+early. Concurrent interval publication is therefore excluded from dispatch_s
+images built with virtualized-unicast support. Such launches still run normally
+and increment `unsupported_launch_drop_count`; the dispatch workaround itself
+is unchanged.
 
 TRISC0 and dispatch_s NCRISC share the dispatch core's L1. This permits a local,
 bounded producer/consumer protocol without adding NOC traffic to the program
@@ -118,11 +122,13 @@ Current static footprint from the generated Blackhole kernels is:
 | dispatch_s TRISC0 monitor | 1,232 B text |
 | reserved profiler BRISC | 2,704 B text, 24 B data |
 | reserved profiler NCRISC | 3,336 B text, 96 B data, 40 B BSS |
-| dispatch_s profiler message | 4,416 B L1 |
+| dispatch_s profiler message | 4,424 B L1 |
 | reserved profiler-core ring and socket config | 262,336 B L1 |
 
-The values above are regression anchors, not architecture limits. Milestone 1
-must report the same measurements after implementation.
+These are the largest payloads observed across the Milestone 0 configurations,
+not one same-configuration image set. They are regression anchors rather than
+the operands used for the component deltas below. Milestone 1 reports a matched
+before/after image pair for its gate arithmetic.
 
 ## Selected protocol
 
@@ -132,7 +138,7 @@ must report the same measurements after implementation.
 | --- | --- | --- |
 | Per-stream start descriptor ring | dispatch_s NCRISC | dispatch_s TRISC0 |
 | Completed interval ring | dispatch_s TRISC0 | dispatch_s NCRISC |
-| A/B transport mailbox | dispatch_s NCRISC | reserved profiler BRISC |
+| Single transport mailbox B | dispatch_s NCRISC | reserved profiler BRISC |
 | Reserved-core L1 ring | reserved profiler BRISC | reserved profiler NCRISC |
 | D2H pages | reserved profiler NCRISC | host receiver |
 
@@ -147,7 +153,7 @@ descriptor contains:
 - runtime ID;
 - start timestamp high and low words;
 - stream completion target;
-- descriptor kind and schema version.
+- reset generation.
 
 dispatch_s captures the start tick and publishes the descriptor immediately
 before sending the go signal. Publishing consists of ordinary L1 stores, a
@@ -156,6 +162,11 @@ Blackhole `fence w,w`, and a final producer-index store.
 If the descriptor ring is full, dispatch_s increments
 `start_descriptor_drop_count` and launches the program without profiling it.
 It never waits for TRISC0.
+
+TRISC0 does not impose a device-cycle deadline on an unmet descriptor because a
+valid program may run arbitrarily long. If an unmet head blocks a full ring, it
+increments `stuck_descriptor_head_count` once for that blocked episode. This
+makes a bad target diagnosable without dropping a valid long-running interval.
 
 Each descriptor also carries the stream reset generation current at publication.
 
@@ -178,7 +189,7 @@ or counted as lost. It never waits for downstream capacity.
 ### Completed interval ring
 
 TRISC0 publishes completed intervals into the existing 128-entry dispatch-core
-record ring. Each entry remains eight words so the existing A/B and D2H record
+record ring. Each entry remains eight words so the existing mailbox and D2H record
 format can be retained:
 
 ```text
@@ -205,10 +216,9 @@ below before reading the producer index and record payload.
 dispatch_s replaces `drain_realtime_profiler_records()` with
 `service_realtime_profiler_once()`:
 
-1. If the A/B mailbox is not idle, return immediately.
-2. If the completed interval ring is empty, try to forward one ready watermark;
-   otherwise return.
-3. Copy one completed record into the next A/B mailbox.
+1. If mailbox B is not idle, return immediately.
+2. If the completed interval ring is empty, return.
+3. Copy one completed record into mailbox B.
 4. Signal the reserved profiler BRISC with the existing inline NOC dword write.
 5. Advance the completed-ring consumer index and return.
 
@@ -222,7 +232,7 @@ dispatch_s:
 - after processing a profiler flush request.
 
 This keeps the common action to a few local loads and branches. A NOC signal is
-issued only when a record is ready and the existing A/B mailbox is idle.
+issued only when a record is ready and mailbox B is idle.
 
 Blackhole has no distinct uncached L1 alias: `uncached_l1_ptr()` is an identity
 operation on this architecture. Both cross-RISC consumers therefore use an
@@ -239,14 +249,11 @@ depend on TRISC0 inheriting a disabled or empty data cache.
 
 ### Reserved profiler core
 
-The BRISC retains the existing A/B NOC-read protocol and remains the sole
+The BRISC retains the existing mailbox-B NOC-read protocol and remains the sole
 producer of the reserved-core L1 ring. Its full-ring behavior changes:
 
-- interval record: increment `transport_drop_count`, acknowledge the A/B
+- interval record: increment `transport_drop_count`, acknowledge mailbox B
   mailbox, and continue;
-- watermark record: retain or replace a single local pending-watermark slot,
-  acknowledge the A/B mailbox, and enqueue the newest pending watermark after
-  ring capacity returns;
 - clock-sync marker: retain the existing explicit sync behavior; sync does not
   execute on the application dispatch path.
 
@@ -254,7 +261,10 @@ The BRISC must not wait for reserved-ring capacity while handling an interval
 from dispatch_s. The NCRISC and D2H socket can stall independently without
 stalling program dispatch; pressure becomes counted interval loss.
 
-## Watermark protocol
+## Planned Milestone 2 watermark protocol
+
+The following section is a reviewed design target, not part of the Milestone 1
+device-publication implementation.
 
 ### Device request
 
@@ -323,16 +333,17 @@ completion.
 ## Lifecycle
 
 Host initialization zeros all queue indices, drop counters, sequences, stream
-reset generations, watermark generations, and A/B state before launching the
-participating kernels. TRISC0 waits for the existing profiler enable word before
-touching the protocol. dispatch_s treats a zero profiler-core NOC coordinate as
+reset generations, termination handshake, and both local mailbox states. It
+publishes the remote mailbox address, launches the reserved-core kernels, writes
+their socket configuration, and only then publishes the nonzero profiler-core
+NOC coordinate that activates dispatch_s and TRISC0. TRISC0 waits for that
+enable word before touching the protocol. dispatch_s treats a zero coordinate as
 disabled and does not publish descriptors.
 
 On the supported Blackhole worker-dispatch route, dispatch_d owns every explicit
 `CLEAR_STREAM`; `process_dispatch_s_wait_cmd()` does not execute. dispatch_d and
 dispatch_s are co-located on the same worker tile and already receive the same
-`REALTIME_PROFILER_MSG_ADDR`. Immediately after the required worker wait and
-before clearing a stream counter, dispatch_d:
+`REALTIME_PROFILER_MSG_ADDR`. After the required worker wait, dispatch_d:
 
 1. clears the hardware stream counter through the existing stream update;
 2. executes a RISC I/O-to-memory fence so the clear is ordered before shared-L1
@@ -341,38 +352,40 @@ before clearing a stream counter, dispatch_d:
    shared profiler L1 block;
 4. executes `fence w,w` and performs no profiler wait.
 
+The epoch is necessarily published just after the hardware clear. The preceding
+worker wait guarantees that every valid old-epoch target is already complete,
+so TRISC0 cannot expose an unfinished valid descriptor in that short window.
+
 This covers sub-device-manager loads, event/reset paths, and host 32-bit
 completion-count wrap because all of them ultimately execute dispatch_d's
 `process_wait(... CLEAR_STREAM ...)` path. Natural 17-bit counter rollover does
 not execute that path and therefore does not change the generation.
 
-dispatch_s and TRISC0 each maintain a local adopted generation per stream.
-Before publishing a descriptor, dispatch_s reads the shared generation. On a
-change it counts unread old-generation descriptors and an old watermark request
-as reset loss, resets its producer state, clears watermark generations, and
-adopts the new generation before publishing new work. TRISC0 checks the same
-generation before its counter and descriptor scan. On a change it consumes and
-counts old-generation descriptors, clears old ready-watermark state, adopts the
-new generation, and samples the newly reset stream before consuming new
-descriptors. Every descriptor carries and must match the adopted generation.
+Before publishing a descriptor, dispatch_s snapshots the shared reset
+generation into it. TRISC0 maintains the local adopted generation per stream
+and checks the shared generation before its counter and descriptor scan. On a
+change it consumes and counts old-generation descriptors, adopts the new
+generation, and only then consumes matching descriptors. Every descriptor must
+match the adopted generation.
 
 TRISC0 calls `invalidate_l1_cache()` before reading the shared generation and
 producer index, and again before reading descriptor payload words. dispatch_s
 performs the same two-step invalidation when it consumes TRISC0 records. Host
 initialization starts both sides at generation zero.
 
-Termination occurs only after application work is quiesced. It is the one
-explicit exception to steady-state nonblocking forwarding: dispatch_s executes
-a fixed-budget terminal handoff loop capped by the dispatch completed-ring
-capacity plus the number of participating stream watermarks. Each iteration may
-forward at most one item and may wait only for the existing A/B acknowledgement;
-the loop also has a device-cycle deadline. It never waits for the host or D2H
-socket directly. If the item/count or cycle budget expires, remaining entries
-are counted as terminal loss and termination proceeds. The reserved profiler
-BRISC drains accepted A/B items into its ring before setting its terminate flag;
-the NCRISC drains that ring before exit. Milestone 2 moves the final host
-collection wait before CQ teardown so a healthy close observes the final batch;
-the bounded device drain remains the failure-safe path.
+Termination occurs only after application work is quiesced. dispatch_s sets a
+dedicated termination request that the mailbox-B IDLE acknowledgement cannot
+overwrite, then waits for TRISC0's stopped acknowledgement with a device-cycle
+deadline. It executes a terminal forwarding loop capped by both the completed
+ring capacity and a device-cycle deadline. Each iteration invokes the same
+nonblocking one-item service. The bounded loop may poll an occupied mailbox B
+for its IDLE acknowledgement until the cycle deadline; this wait is permitted
+only after application work has quiesced and lets the last accepted record
+advance. After a successful observer stop, remaining completed records and
+start descriptors are counted in
+dedicated terminal-loss counters. Observer-stop timeout has its own counter.
+The reserved profiler BRISC observes the dedicated request, sets its ring
+terminate flag, and the NCRISC drains accepted ring entries before exit.
 
 A timeout or terminal loss is reported as an incomplete/lossy collection; it
 must not trigger a D2H tensor fallback or host-duration substitution.
@@ -392,12 +405,13 @@ Milestone 1 must preserve these edges:
 4. dispatch_s invalidates its Blackhole L1 cache before reading the
    completed-ring producer index and invalidates again before reading payload
    words;
-5. A/B words are visible before the inline NOC state notification;
-6. BRISC completes the NOC read before acknowledging A/B idle;
+5. mailbox-B words are visible before the inline NOC state notification;
+6. BRISC completes the NOC read before acknowledging mailbox B idle;
 7. BRISC ring-slot data is visible before its producer-index publish;
 8. NCRISC completes D2H writes before advancing the local consumer index;
-9. a device watermark is enqueued after every accepted interval through its
-   snapshotted producer index.
+
+Milestone 2 must add and separately prove watermark ordering after every
+accepted interval through its snapshotted producer index.
 
 The Blackhole implementation will use explicit RISC `fence w,w` instructions at
 local-L1 publication points and existing NOC read/write barriers at NOC
@@ -468,15 +482,108 @@ Expected files are limited to:
 - `tt_metal/impl/dispatch/kernels/cq_realtime_profiler_dispatch_subordinate.hpp`;
 - `tt_metal/impl/dispatch/kernels/cq_realtime_profiler.cpp`;
 - `tt_metal/impl/dispatch/kernels/realtime_profiler_ring_buffer.hpp`;
+- `tt_metal/impl/dispatch/kernels/realtime_profiler.hpp` for removal of
+  obsolete ping-pong helpers;
+- `tt_metal/impl/dispatch/kernels/realtime_profiler_protocol.hpp`;
+- `tt_metal/impl/dispatch/kernels/REALTIME_PROFILER.md`;
 - `tt_metal/impl/dispatch/kernels/cq_commands.hpp`;
 - `tt_metal/impl/dispatch/device_command.hpp`;
 - `tt_metal/impl/dispatch/device_command.cpp`;
 - `tt_metal/impl/program/dispatch.hpp`;
 - `tt_metal/impl/program/dispatch.cpp`;
-- `tt_metal/distributed/fd_mesh_command_queue.cpp` for exact worker-count and
-  shared batch-watermark plumbing;
+- `tt_metal/distributed/fd_mesh_command_queue.cpp` for exact worker-count
+  plumbing;
+- `tt_metal/distributed/realtime_profiler_manager.hpp` and
+  `tt_metal/distributed/realtime_profiler_manager.cpp` for Blackhole capability
+  gating, protocol-key propagation, and focused device-loss diagnostics;
 - focused profiler tests and this documentation.
 
 Host collection and public result changes belong to Milestone 2. If Milestone 1
 requires edits outside this list, the reason must be documented before the diff
 is reviewed.
+
+## Milestone 1 implementation evidence
+
+The device publication path is implemented and gated in host eligibility to
+Blackhole. `CQDispatchGoSignalMcastCmd` remains 16 bytes including its command
+ID: the exact launch worker count occupies one byte and `wait_stream` is narrowed
+to one byte with host range checks. Worker counts above 255 are encoded as zero,
+which makes the launch explicitly unprofiled instead of aborting the application.
+The dispatch-core message is 5,080 bytes, an increase of 656 bytes from the
+corrected 4,424-byte baseline and below the 8 KiB gate. The reserved
+profiler-core layout remains 262,336 bytes.
+
+The single 32-byte mailbox-B payload deliberately precedes the independent
+termination words. This preserves its 16-byte Blackhole NOC alignment;
+firmware compile-time checks validate the generated buffer-B address and
+alignment. Removing the unused A payload and state avoids dead storage and
+state-machine branches.
+
+The Blackhole images produced by the focused Release test have these payloads:
+
+| Component | Milestone 1 measured image payload | Milestone 0 gate |
+| --- | ---: | ---: |
+| dispatch_s NCRISC | 5,952 B text, 56 B data, 356 B BSS | 5,628 B text; +324 B |
+| dispatch_s TRISC0 monitor | 1,240 B text | 900 B text; +340 B |
+| reserved profiler BRISC | 912 B text | 964 B text; -52 B |
+| reserved profiler NCRISC | 1,592 B text, 48 B data, 24 B BSS | no intentional source change |
+
+The before/after image pairs use the same Blackhole worker-dispatch,
+one-command-queue, eight-stream configuration. The protocol build key changes
+the JIT identity so old layouts cannot reuse a current image.
+
+Validation on the local four-chip P150b Blackhole QuietBox, firmware 19.10.0,
+KMD 2.10.0, IOMMU enabled:
+
+```text
+cmake --build build_Release --target unit_tests_dispatch -j 32
+  PASS
+
+tt-metalium-validation-basic --gtest_filter='RealtimeProfilerSanity.*'
+  includes disabled-close, concurrent completion, full-buffer, multi-ready,
+  reset-generation, callback, finish, and trace coverage
+
+unit_tests_dispatch \
+  --gtest_filter='RealtimeProfilerSanity.ConcurrentPartitionedSubDevicesUseIndependentCompletionTargets' \
+  --gtest_repeat=10 --gtest_break_on_failure
+  10/10 PASS
+```
+
+The concurrent test warms the three kernel launches before measurement,
+selects each independent sub-device through the dispatch stall group, and
+asserts from device ticks that both short-stream intervals start and end before
+the long first-stream interval ends. The third stream also exercises the go
+command word that is reused as aligned NOC staging. Host timestamps are not
+captured or substituted.
+
+The unchanged 4,096-program `RealtimeProfilerStress.PeakLoadPreservesRecords`
+trace completed one replay in 3.9 seconds under the same external 120-second
+guard. It delivered all 16,388 expected records across four devices with zero
+transport drops and a peak D2H FIFO occupancy of 66/32,768 pages. The earlier
+timeout was the disabled/ineligible observer-shutdown bug: TRISC0 was launched
+but its terminate request was conditional on profiler activation. Termination
+is now unconditional and the disabled-close test covers this route.
+
+Six paired 1,024-program op-to-op runs measured the final enabled path against
+`TT_METAL_DISABLE_REALTIME_PROFILER=1`, reversing run order on alternating
+pairs. Median totals were 52,461.5 us enabled and 52,056 us disabled (+0.78%);
+means were 52,447.8 us and 52,392.5 us (+0.11%). Per-pair differences ranged
+from -2,462 us to +1,428 us, so the observed delta is within paired-run noise.
+This is a host
+dispatch-throughput overhead signal only. Device interval durations continue
+to come exclusively from device ticks. It is not a disabled-new-code versus
+Milestone-0 binary comparison, so the evidence only bounds the current enabled
+cost; the guarded `CLEAR_STREAM` path and activation checks are what keep the
+new queue work out of an ineligible profiler run.
+
+TRISC0 records the first sampled device tick after the completion predicate is
+observed. The sampling delay is bounded by the observer loop period, but that
+period has not yet been characterized on silicon. Milestone 3 must measure it
+before making an absolute end-timestamp error claim; Milestone 1's concurrent
+test establishes ordering from device ticks, not sub-poll-cycle accuracy.
+
+Watermarks, collection results, timeout reporting, and host-visible deltas for
+the dispatch-core source-drop counters remain Milestone 2 work. Milestone 1 now
+has deterministic device injection for descriptor-ring fullness,
+completed-record-ring fullness, multi-ready coalescing, and reset-generation
+cleanup; each path reports stage-specific loss without blocking execution.

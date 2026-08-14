@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Real-time profiler BRISC kernel (fast path)
-// Reads timestamp data from dispatch_s A/B buffers and writes it into an L1
+// Reads timestamp data from dispatch_s mailbox B and writes it into an L1
 // ring buffer. The companion NCRISC kernel drains the ring buffer to the host
 // via PCIe. This split decouples the NOC read from the PCIe push, allowing
 // dispatch_s to proceed without waiting.
@@ -18,11 +18,13 @@
 
 // Size of timestamp data to read from dispatch core (kernel_start + kernel_end)
 constexpr uint32_t realtime_profiler_timestamp_size = 2 * sizeof(realtime_profiler_timestamp_t);  // 32 bytes
+static_assert(
+    DISPATCH_DATA_ADDR_B == REALTIME_PROFILER_MSG_ADDR + __builtin_offsetof(realtime_profiler_msg_t, kernel_start_b));
+static_assert((DISPATCH_DATA_ADDR_B % L1_ALIGNMENT) == 0);
 
 // Compile-time defines set by host:
 // DISPATCH_CORE_NOC_X  - NOC X coordinate of dispatch_s core
 // DISPATCH_CORE_NOC_Y  - NOC Y coordinate of dispatch_s core
-// DISPATCH_DATA_ADDR_A - Address of kernel_start_a in dispatch_s's L1 mailbox
 // DISPATCH_DATA_ADDR_B - Address of kernel_start_b in dispatch_s's L1 mailbox
 // DISPATCH_PROFILER_STATE_ADDR - dispatch_s state word acknowledged after each read
 // RING_BUFFER_ADDR     - L1 address of the shared ring buffer
@@ -36,27 +38,23 @@ volatile tt_l1_ptr realtime_profiler_msg_t* rt_profiler_msg =
 volatile RtProfilerRingBuffer* ring_buffer = reinterpret_cast<volatile RtProfilerRingBuffer*>(RING_BUFFER_ADDR);
 
 // Read timestamps from dispatch_s into the next ring buffer slot
-__attribute__((noinline)) void realtime_profiler_read_and_enqueue(bool buffer_a) {
-    // Heartbeat: ring_full_wait_count increments once per enqueue blocked on a full ring.
-    // Host post-mortems can pair it with ncrisc_debug.socket_reserve_pages_{enter,exit}_count.
+__attribute__((noinline)) void realtime_profiler_read_and_enqueue() {
+    // Never backpressure dispatch through the mailbox acknowledgement. If the
+    // reserved-core ring is full, account the lost interval and acknowledge it.
     if (rt_ring_full(ring_buffer)) {
-        ring_buffer->ring_full_wait_count++;
-        while (rt_ring_full(ring_buffer)) {
-            invalidate_l1_cache();
+        ring_buffer->transport_drop_count++;
+    } else {
+        uint32_t slot_addr = rt_ring_data_addr(ring_buffer, ring_buffer->write_index);
+
+        uint64_t dispatch_noc_addr = get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, DISPATCH_DATA_ADDR_B);
+
+        noc_async_read(dispatch_noc_addr, slot_addr, realtime_profiler_timestamp_size);
+        noc_async_read_barrier();
+
+        const uint32_t id = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot_addr)[2];
+        if (id != REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID) {
+            ring_buffer->write_index++;
         }
-    }
-
-    uint32_t slot_addr = rt_ring_data_addr(ring_buffer, ring_buffer->write_index);
-
-    uint32_t dispatch_data_addr = buffer_a ? DISPATCH_DATA_ADDR_A : DISPATCH_DATA_ADDR_B;
-    uint64_t dispatch_noc_addr = get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, dispatch_data_addr);
-
-    noc_async_read(dispatch_noc_addr, slot_addr, realtime_profiler_timestamp_size);
-    noc_async_read_barrier();
-
-    const uint32_t id = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot_addr)[2];
-    if (id != REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID) {
-        ring_buffer->write_index++;
     }
 
     rt_profiler_msg->realtime_profiler_state = REALTIME_PROFILER_STATE_IDLE;
@@ -77,7 +75,7 @@ __attribute__((noinline)) void realtime_profiler_sync() {
     volatile tt_reg_ptr uint32_t* p_reg = reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
 
     uint32_t sync_count = 0;
-    while (rt_profiler_msg->sync_request) {
+    while (rt_profiler_msg->sync_request && rt_profiler_msg->terminate_requested == 0) {
         invalidate_l1_cache();
 
         uint32_t host_time = rt_profiler_msg->sync_host_timestamp;
@@ -127,6 +125,16 @@ void kernel_main() {
     while (true) {
         invalidate_l1_cache();
 
+        if (rt_profiler_msg->terminate_requested != 0) {
+            // A notification already accepted by dispatch_s must be consumed
+            // (or counted as a transport drop) before the reserved core exits.
+            if (rt_profiler_msg->realtime_profiler_state == REALTIME_PROFILER_STATE_PUSH_B) {
+                realtime_profiler_read_and_enqueue();
+            }
+            ring_buffer->terminate = 1;
+            return;
+        }
+
         RealtimeProfilerState state = static_cast<RealtimeProfilerState>(rt_profiler_msg->realtime_profiler_state);
 
         switch (state) {
@@ -137,11 +145,7 @@ void kernel_main() {
                 }
                 continue;
 
-            case REALTIME_PROFILER_STATE_PUSH_A: realtime_profiler_read_and_enqueue(true); break;
-
-            case REALTIME_PROFILER_STATE_PUSH_B: realtime_profiler_read_and_enqueue(false); break;
-
-            case REALTIME_PROFILER_STATE_TERMINATE: ring_buffer->terminate = 1; return;
+            case REALTIME_PROFILER_STATE_PUSH_B: realtime_profiler_read_and_enqueue(); break;
         }
     }
 }

@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Merge-gate sanity check for the real-time (RT) profiler on Wormhole and
-// Blackhole single-chip configurations. Enqueues a handful of compute
+// Sanity checks for the real-time (RT) profiler on Blackhole single-chip
+// configurations. Enqueues a handful of compute
 // programs back-to-back on all tensix cores, attaches an RT profiler
 // callback, and asserts that each program produces a record with a
 // plausible start/end timestamp. The goal is to catch coarse regressions
@@ -11,14 +11,13 @@
 // handshake, kernel source propagation, timestamp extraction) before they
 // reach CI's longer-running profiler test suite.
 //
-// Lives in the dispatch "basic" test library so it runs as part of
-// `tt-metalium-validation-basic`, which the merge-gate `metalium-basic-tests`
-// job executes on both N150 (WH) and P150b (BH). On configs where RT
+// Lives in the dispatch "basic" test library. On configurations where RT
 // profiler cannot be enabled (ETH dispatch, non-MMIO chip, kernels
 // nullified, IOMMU-off on BH, etc.) the test skips gracefully via
 // IsProgramRealtimeProfilerActive().
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <mutex>
 #include <set>
@@ -42,6 +41,11 @@
 #include <tt-metalium/program.hpp>
 #include <tt-metalium/experimental/realtime_profiler.hpp>
 
+#include "tt_metal/distributed/mesh_device_impl.hpp"
+#include "tt_metal/distributed/realtime_profiler_manager.hpp"
+#include "hostdev/realtime_profiler_msgs.h"
+#include "tt_metal/impl/dispatch/kernels/realtime_profiler_protocol.hpp"
+
 namespace tt::tt_metal {
 namespace {
 
@@ -62,6 +66,52 @@ constexpr double kMaxDurationNs = 1'000'000'000.0;
 // Per-program marker embedded in the kernel source so the source-correlation
 // assertion can verify each record carries the correct source.
 constexpr const char* kSourceMarkerPrefix = "rt_profiler_marker_";
+
+struct ScopedEnvUnset {
+    const char* name;
+    ~ScopedEnvUnset() { ::unsetenv(name); }
+};
+
+TEST(RealtimeProfilerProtocol, CompletionCounterAndQueueIndicesWrapWithoutAmbiguity) {
+    constexpr uint32_t kCounterWidth = 17;
+    constexpr uint32_t kCounterMax = (1u << kCounterWidth) - 1;
+
+    EXPECT_EQ(realtime_profiler_completion_target<kCounterWidth>(kCounterMax - 1, 3), 1u);
+    EXPECT_TRUE(realtime_profiler_stream_count_ge<kCounterWidth>(0, kCounterMax));
+    EXPECT_TRUE(realtime_profiler_stream_count_ge<kCounterWidth>(1, 1));
+    EXPECT_TRUE(realtime_profiler_stream_count_ge<kCounterWidth>(1, 0));
+    EXPECT_FALSE(realtime_profiler_stream_count_ge<kCounterWidth>(kCounterMax, 0));
+    EXPECT_FALSE(realtime_profiler_stream_count_ge<kCounterWidth>(0, 1));
+
+    constexpr uint32_t read_index = UINT32_MAX - 1;
+    EXPECT_FALSE(realtime_profiler_queue_full(read_index + 3, read_index, 4));
+    EXPECT_TRUE(realtime_profiler_queue_full(read_index + 4, read_index, 4));
+    EXPECT_TRUE(realtime_profiler_queue_full(read_index + 5, read_index, 4));
+    EXPECT_EQ(realtime_profiler_completion_target<kCounterWidth>(0x20005, 3), 8u);
+    EXPECT_FALSE(realtime_profiler_stream_count_ge<kCounterWidth>(0, 1u << (kCounterWidth - 1)));
+    EXPECT_TRUE(realtime_profiler_generation_after(0, UINT32_MAX));
+    EXPECT_FALSE(realtime_profiler_generation_after(UINT32_MAX, 0));
+
+    const auto& factory =
+        MetalContext::instance().hal().get_realtime_profiler_msgs_factory(HalProgrammableCoreType::TENSIX);
+    using GeneratedMessage = realtime_profiler_msgs::realtime_profiler_msg_t;
+    EXPECT_EQ(factory.size_of<GeneratedMessage>(), sizeof(::realtime_profiler_msg_t));
+    EXPECT_EQ(
+        factory.offset_of<GeneratedMessage>(GeneratedMessage::Field::kernel_start_b),
+        offsetof(::realtime_profiler_msg_t, kernel_start_b));
+}
+
+TEST(RealtimeProfilerSanity, DisabledProfilerStillStopsDispatchObserver) {
+    constexpr int kDeviceId = 0;
+    ASSERT_EQ(::setenv("TT_METAL_DISABLE_REALTIME_PROFILER", "1", /*overwrite=*/1), 0);
+    ScopedEnvUnset restore_env{"TT_METAL_DISABLE_REALTIME_PROFILER"};
+
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    EXPECT_FALSE(IsProgramRealtimeProfilerActive());
+    EXPECT_TRUE(mesh_device->close());
+}
 
 // Inlined kernel source: 200 × 200 = 40K unrolled NOPs. Used for both data
 // movement (BRISC/NCRISC) and compute (TRISC) RISCs. We inline rather than
@@ -118,6 +168,43 @@ void enqueue_sanity_program(
     distributed::EnqueueMeshWorkload(mesh_device->mesh_command_queue(), workload, /*blocking=*/false);
 }
 
+std::string make_concurrent_kernel_source(uint32_t outer_iterations) {
+    return "#include <cstdint>\n"
+           "void kernel_main() {\n"
+           "    for (volatile uint32_t i = 0; i < " +
+           std::to_string(outer_iterations) +
+           "; ++i) {\n"
+           "#pragma GCC unroll 200\n"
+           "        for (uint32_t j = 0; j < 200; ++j) { asm volatile(\"nop\"); }\n"
+           "    }\n"
+           "}\n";
+}
+
+void enqueue_concurrent_program(
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    const CoreCoord& core,
+    uint32_t runtime_id,
+    uint32_t outer_iterations) {
+    Program program = CreateProgram();
+    const std::string source = make_concurrent_kernel_source(outer_iterations);
+    CreateKernelFromString(
+        program,
+        source,
+        core,
+        DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
+    CreateKernelFromString(
+        program,
+        source,
+        core,
+        DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default});
+    CreateKernelFromString(program, source, core, ComputeConfig{});
+    program.set_runtime_id(runtime_id);
+
+    distributed::MeshWorkload workload;
+    workload.add_program(distributed::MeshCoordinateRange(mesh_device->shape()), std::move(program));
+    distributed::EnqueueMeshWorkload(mesh_device->mesh_command_queue(), workload, /*blocking=*/false);
+}
+
 TEST(RealtimeProfilerSanity, FiveProgramsBackToBack) {
     constexpr int kDeviceId = 0;
 
@@ -163,10 +250,23 @@ TEST(RealtimeProfilerSanity, FiveProgramsBackToBack) {
     // for small workloads on WH/BH single-chip.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
+    auto* rt_profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(rt_profiler, nullptr);
+    const auto device_losses = rt_profiler->device_loss_counts();
+    const auto transport_drops = rt_profiler->transport_drop_count();
+
     UnregisterProgramRealtimeProfilerCallback(handle);
 
+    std::string observed_ids;
+    for (const auto& record : records) {
+        observed_ids += fmt::format("{} ", record.runtime_id);
+    }
     ASSERT_GE(records.size(), kNumPrograms)
-        << "Expected at least " << kNumPrograms << " RT profiler records (one per program), got " << records.size();
+        << "Expected at least " << kNumPrograms << " RT profiler records (one per program), got " << records.size()
+        << "; start drops=" << device_losses.start_descriptor
+        << ", observer drops=" << device_losses.completion_observer
+        << ", record drops=" << device_losses.completed_record << ", transport drops=" << transport_drops
+        << "; observed runtime IDs: " << observed_ids;
     EXPECT_EQ(dropped, 0u);
 
     for (const auto& rec : records) {
@@ -205,6 +305,194 @@ TEST(RealtimeProfilerSanity, FiveProgramsBackToBack) {
     }
     EXPECT_EQ(programs_with_correct_sources.size(), kNumPrograms)
         << "Not every program's source was correctly correlated by runtime ID";
+}
+
+TEST(RealtimeProfilerSanity, ConcurrentPartitionedSubDevicesUseIndependentCompletionTargets) {
+    constexpr int kDeviceId = 0;
+    constexpr uint32_t kSlowRuntimeId = 0x7101;
+    constexpr uint32_t kFastRuntimeId = 0x7102;
+    constexpr uint32_t kThirdRuntimeId = 0x7103;
+
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    const CoreCoord grid = mesh_device->compute_with_storage_grid_size();
+    if (grid.x < 3) {
+        mesh_device->close();
+        GTEST_SKIP() << "Concurrent sub-device profiler test requires three Tensix cores in one row";
+    }
+    const CoreCoord slow_core{0, 0};
+    const CoreCoord fast_core{1, 0};
+    const CoreCoord third_core{2, 0};
+    SubDevice slow_sub_device(std::array{CoreRangeSet(CoreRange(slow_core, slow_core))});
+    SubDevice fast_sub_device(std::array{CoreRangeSet(CoreRange(fast_core, fast_core))});
+    SubDevice third_sub_device(std::array{CoreRangeSet(CoreRange(third_core, third_core))});
+    auto manager = mesh_device->create_sub_device_manager({slow_sub_device, fast_sub_device, third_sub_device}, 3200);
+    mesh_device->load_sub_device_manager(manager);
+
+    // Compile and cache both kernel shapes before the measured launches. Otherwise
+    // host-side JIT work for the second program can outlast the first device program,
+    // preventing the two asynchronous launches from overlapping at all.
+    enqueue_concurrent_program(mesh_device, slow_core, /*runtime_id=*/0, 200000);
+    enqueue_concurrent_program(mesh_device, fast_core, /*runtime_id=*/0, 20);
+    enqueue_concurrent_program(mesh_device, third_core, /*runtime_id=*/0, 20);
+    distributed::Finish(mesh_device->mesh_command_queue());
+
+    std::vector<ProgramRealtimeRecord> records;
+    uint64_t callback_drops = 0;
+    const auto handle =
+        RegisterProgramRealtimeProfilerCallback([&records, &callback_drops](const ProgramRealtimeRecordBatch& batch) {
+            callback_drops += batch.dropped;
+            records.insert(records.end(), batch.records.begin(), batch.records.end());
+        });
+
+    // Launch the long stream first, then a much shorter program on an independent
+    // stream. Correct profiler completion targets produce overlapping intervals
+    // with the second stream completing first.
+    enqueue_concurrent_program(mesh_device, slow_core, kSlowRuntimeId, 200000);
+    mesh_device->set_sub_device_stall_group({{SubDeviceId{1}}});
+    enqueue_concurrent_program(mesh_device, fast_core, kFastRuntimeId, 20);
+    mesh_device->set_sub_device_stall_group({{SubDeviceId{2}}});
+    enqueue_concurrent_program(mesh_device, third_core, kThirdRuntimeId, 20);
+    mesh_device->reset_sub_device_stall_group();
+    distributed::Finish(mesh_device->mesh_command_queue());
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    auto* rt_profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(rt_profiler, nullptr);
+    const auto device_losses = rt_profiler->device_loss_counts();
+    EXPECT_EQ(device_losses.total(), 0u);
+    EXPECT_EQ(rt_profiler->transport_drop_count(), 0u);
+    UnregisterProgramRealtimeProfilerCallback(handle);
+
+    const ProgramRealtimeRecord* slow = nullptr;
+    const ProgramRealtimeRecord* fast = nullptr;
+    const ProgramRealtimeRecord* third = nullptr;
+    std::string observed_runtime_ids;
+    for (const auto& record : records) {
+        observed_runtime_ids +=
+            fmt::format("{}:[{},{}] ", record.runtime_id, record.start_timestamp, record.end_timestamp);
+        if (record.runtime_id == kSlowRuntimeId) {
+            slow = &record;
+        } else if (record.runtime_id == kFastRuntimeId) {
+            fast = &record;
+        } else if (record.runtime_id == kThirdRuntimeId) {
+            third = &record;
+        }
+    }
+    ASSERT_NE(slow, nullptr) << "Missing interval from sub-device 0; observed runtime IDs: " << observed_runtime_ids;
+    ASSERT_NE(fast, nullptr) << "Missing interval from sub-device 1";
+    ASSERT_NE(third, nullptr) << "Missing interval from sub-device 2";
+    EXPECT_EQ(callback_drops, 0u);
+    EXPECT_LT(slow->start_timestamp, fast->end_timestamp);
+    EXPECT_LT(fast->start_timestamp, slow->end_timestamp);
+    EXPECT_LT(fast->end_timestamp, slow->end_timestamp)
+        << "The short program on the second stream should complete before the long first-stream program"
+        << " (slow=[" << slow->start_timestamp << ", " << slow->end_timestamp << "], fast=[" << fast->start_timestamp
+        << ", " << fast->end_timestamp << "])";
+    EXPECT_LT(third->start_timestamp, slow->end_timestamp);
+    EXPECT_LT(third->end_timestamp, slow->end_timestamp)
+        << "The third sub-device interval validates go-command fields that share the in-place staging word";
+
+    mesh_device->clear_loaded_sub_device_manager();
+    EXPECT_TRUE(mesh_device->close());
+}
+
+TEST(RealtimeProfilerSanity, FullDeviceQueuesCountDropsWithoutStallingDispatch) {
+    constexpr int kDeviceId = 0;
+    constexpr uint32_t kRuntimeId = 0x7201;
+
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    const CoreCoord core{0, 0};
+    SubDevice sub_device(std::array{CoreRangeSet(CoreRange(core, core))});
+    auto manager = mesh_device->create_sub_device_manager({sub_device}, 3200);
+    mesh_device->load_sub_device_manager(manager);
+
+    // Warm the program cache before injecting queue state so compilation is
+    // outside the fault-injection window.
+    enqueue_concurrent_program(mesh_device, core, /*runtime_id=*/0, 20);
+    distributed::Finish(mesh_device->mesh_command_queue());
+
+    auto* rt_profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(rt_profiler, nullptr);
+    const auto initial_losses = rt_profiler->device_loss_counts();
+
+    // A target well ahead of the fresh stream counter keeps the synthetic
+    // descriptors queued while dispatch_s attempts to publish this launch.
+    rt_profiler->prime_start_descriptor_queue_full_for_testing(/*stream_index=*/0, /*completion_target=*/4096);
+    enqueue_concurrent_program(mesh_device, core, kRuntimeId, 20);
+    distributed::Finish(mesh_device->mesh_command_queue());
+    const auto start_full_losses = rt_profiler->device_loss_counts();
+    EXPECT_GT(start_full_losses.start_descriptor, initial_losses.start_descriptor);
+    EXPECT_GT(start_full_losses.stuck_descriptor_head, initial_losses.stuck_descriptor_head);
+    rt_profiler->clear_start_descriptor_queue_for_testing(/*stream_index=*/0);
+
+    // Hold the completed-record queue in a synthetic over-capacity state. The
+    // observer must account a ready interval instead of waiting for space.
+    rt_profiler->prime_completed_record_queue_full_for_testing();
+    rt_profiler->prime_start_descriptor_queue_full_for_testing(/*stream_index=*/0, /*completion_target=*/0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto record_full_losses = rt_profiler->device_loss_counts();
+    EXPECT_GT(record_full_losses.completed_record, start_full_losses.completed_record)
+        << "losses after injected full record queue: start=" << record_full_losses.start_descriptor
+        << ", unsupported=" << record_full_losses.unsupported_launch
+        << ", reset=" << record_full_losses.reset_descriptor << ", observer=" << record_full_losses.completion_observer
+        << ", record=" << record_full_losses.completed_record;
+    rt_profiler->clear_start_descriptor_queue_for_testing(/*stream_index=*/0);
+    rt_profiler->clear_completed_record_queue_for_testing();
+
+    mesh_device->clear_loaded_sub_device_manager();
+    EXPECT_TRUE(mesh_device->close());
+}
+
+TEST(RealtimeProfilerSanity, CompletionObserverAccountsMultiReadyAndResetDescriptors) {
+    constexpr int kDeviceId = 0;
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    auto* rt_profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(rt_profiler, nullptr);
+    const auto initial_losses = rt_profiler->device_loss_counts();
+
+    // On a fresh device stream 0 is at count zero, so all four synthetic
+    // descriptors become ready in one scan. The observer keeps the newest
+    // interval and accounts the other three.
+    rt_profiler->prime_start_descriptor_queue_full_for_testing(/*stream_index=*/0, /*completion_target=*/0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto multi_ready_losses = rt_profiler->device_loss_counts();
+    EXPECT_GE(
+        multi_ready_losses.completion_observer,
+        initial_losses.completion_observer + realtime_profiler_msgs::REALTIME_PROFILER_START_QUEUE_CAPACITY - 1);
+    rt_profiler->clear_start_descriptor_queue_for_testing(/*stream_index=*/0);
+
+    // Publish old-generation descriptors with an unmet target, then advance
+    // the reset epoch. The observer must discard all stale entries explicitly.
+    rt_profiler->prime_start_descriptor_queue_full_for_testing(/*stream_index=*/0, /*completion_target=*/4096);
+    rt_profiler->advance_stream_reset_generation_for_testing(/*stream_index=*/0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto reset_losses = rt_profiler->device_loss_counts();
+    EXPECT_GE(
+        reset_losses.reset_descriptor,
+        multi_ready_losses.reset_descriptor + realtime_profiler_msgs::REALTIME_PROFILER_START_QUEUE_CAPACITY);
+    rt_profiler->clear_start_descriptor_queue_for_testing(/*stream_index=*/0);
+
+    EXPECT_TRUE(mesh_device->close());
 }
 
 TEST(RealtimeProfilerSanity, CloseDrainsRegisteredCallback) {

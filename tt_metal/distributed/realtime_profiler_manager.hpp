@@ -44,6 +44,23 @@ struct RealtimeProfilerCoreL1Addrs {
     uint32_t socket_config = 0;
 };
 
+struct RealtimeProfilerDeviceLossCounts {
+    uint64_t start_descriptor = 0;
+    uint64_t unsupported_launch = 0;
+    uint64_t reset_descriptor = 0;
+    uint64_t completion_observer = 0;
+    uint64_t stuck_descriptor_head = 0;
+    uint64_t completed_record = 0;
+    uint64_t terminal_descriptor = 0;
+    uint64_t terminal_record = 0;
+    uint64_t completion_observer_timeout = 0;
+
+    uint64_t total() const {
+        return start_descriptor + unsupported_launch + reset_descriptor + completion_observer + stuck_descriptor_head +
+               completed_record + terminal_descriptor + terminal_record + completion_observer_timeout;
+    }
+};
+
 // Owns the RT-profiler subsystem for one MeshDevice: per-device state, the receiver thread, the Tracy handler, and the
 // host-device sync handshake (sharded across a small worker pool, with a 60s per-chip throttle).
 class RealtimeProfilerManager : private tt::RealtimeProfilerCallbackListener {
@@ -69,7 +86,15 @@ public:
     uint32_t host_fifo_capacity_pages() const;
     uint64_t num_published_records() const { return num_published_records_.load(std::memory_order_relaxed); }
     uint64_t num_published_batches() const { return num_published_batches_.load(std::memory_order_relaxed); }
-    uint32_t ring_full_wait_count() const;  // reads device L1
+    uint32_t transport_drop_count() const;                        // reads device L1
+    RealtimeProfilerDeviceLossCounts device_loss_counts() const;  // reads dispatch_s L1
+    void prime_start_descriptor_queue_full_for_testing(uint32_t stream_index, uint32_t completion_target) const;
+    void advance_stream_reset_generation_for_testing(uint32_t stream_index) const;
+    void clear_start_descriptor_queue_for_testing(uint32_t stream_index) const;
+    // Device fault injection for focused profiler tests only. These methods
+    // require the normal finish-sync state machine to be idle.
+    void prime_completed_record_queue_full_for_testing();
+    void clear_completed_record_queue_for_testing();
     size_t num_active_devices() const { return devices_.size(); }
 
 private:
@@ -78,6 +103,8 @@ private:
         uint32_t chip_id = 0;
         MeshCoordinate mesh_coord = MeshCoordinate(0);
         CoreCoord realtime_profiler_core;
+        CoreCoord dispatch_s_core;
+        uint32_t dispatch_s_profiler_msg_addr = 0;
         std::unique_ptr<D2HSocket> socket;
         // Owns the BRISC+NCRISC program to keep its kernels (and their metadata for tt-inspector) alive for the
         // manager's lifetime.

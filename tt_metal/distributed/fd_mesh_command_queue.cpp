@@ -508,6 +508,7 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
             cq_shared_state_->worker_launch_message_buffer_state[*sub_device_id].get_mcast_wptr(),
             cq_shared_state_->worker_launch_message_buffer_state[*sub_device_id].get_unicast_wptr(),
             expected_num_workers_completed,
+            num_workers,
             this->virtual_program_dispatch_core(),
             sub_device_id,
             dispatch_metadata,

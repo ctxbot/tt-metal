@@ -7,6 +7,7 @@
 #include "api/compute/compute_kernel_api.h"
 #include "hostdev/realtime_profiler_msgs.h"
 #include "tt_metal/impl/dispatch/kernels/realtime_profiler.hpp"
+#include "tt_metal/impl/dispatch/kernels/realtime_profiler_protocol.hpp"
 
 // Stream register definitions
 #define NOC_OVERLAY_START_ADDR 0xFFB40000
@@ -40,41 +41,151 @@ FORCE_INLINE void dispatch_subordinate_realtime_profiler() {
 
     // Wait until host explicitly enables RT profiler, or terminate if RT is not used.
     while (rt_profiler_msg->realtime_profiler_core_noc_xy == 0) {
-        if (rt_profiler_msg->realtime_profiler_state == REALTIME_PROFILER_STATE_TERMINATE) {
+        invalidate_l1_cache();
+        if (rt_profiler_msg->terminate_requested != 0) {
+            rt_profiler_msg->completion_observer_stopped = 1;
             return;
         }
     }
 
-    if (rt_profiler_msg->realtime_profiler_state == REALTIME_PROFILER_STATE_TERMINATE) {
-        rt_profiler_msg->realtime_profiler_state = REALTIME_PROFILER_STATE_IDLE;
-    }
-
-    uint32_t last_counts[num_streams_to_monitor];
+    static_assert(num_streams_to_monitor <= REALTIME_PROFILER_MAX_STREAMS);
+    uint32_t adopted_generation[num_streams_to_monitor];
+    bool stuck_head_reported[num_streams_to_monitor];
     for (uint32_t i = 0; i < num_streams_to_monitor; i++) {
-        uint32_t stream_id = first_stream_index + i;
-        volatile uint32_t* stream_reg =
-            (volatile uint32_t*)STREAM_REG_ADDR(stream_id, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX);
-        last_counts[i] = *stream_reg & ((1u << MEM_WORD_ADDR_WIDTH) - 1);
-        rt_profiler_msg->stream_completion_count[i] = last_counts[i];
+        invalidate_l1_cache();
+        adopted_generation[i] = rt_profiler_msg->stream_reset_generation[i];
+        stuck_head_reported[i] = false;
     }
 
-    while (rt_profiler_msg->realtime_profiler_state != REALTIME_PROFILER_STATE_TERMINATE) {
+    while (rt_profiler_msg->terminate_requested == 0) {
+        invalidate_l1_cache();
         for (uint32_t i = 0; i < num_streams_to_monitor; i++) {
             uint32_t stream_id = first_stream_index + i;
             volatile uint32_t* stream_reg =
                 (volatile uint32_t*)STREAM_REG_ADDR(stream_id, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX);
 
-            uint32_t current_count = *stream_reg & ((1u << MEM_WORD_ADDR_WIDTH) - 1);
-            if (current_count != last_counts[i]) {
-                DeviceZoneScopedN("TRISC0-record-end-ts");
-                last_counts[i] = current_count;
-                uint32_t time_hi = 0;
-                uint32_t time_lo = 0;
-                read_realtime_wall_clock(&time_hi, &time_lo);
-                rt_profiler_msg->stream_end_time_hi[i] = time_hi;
-                rt_profiler_msg->stream_end_time_lo[i] = time_lo;
-                rt_profiler_msg->stream_completion_count[i] = current_count;
+            invalidate_l1_cache();
+            const uint32_t generation = rt_profiler_msg->stream_reset_generation[i];
+            uint32_t read_index = rt_profiler_msg->start_descriptor_read_index[i];
+            const uint32_t write_index = rt_profiler_msg->start_descriptor_write_index[i];
+
+            // The producer publishes every descriptor payload before its write
+            // index. One invalidation after observing that index makes the
+            // entire snapshotted batch visible; invalidating once per entry
+            // only adds polling overhead.
+            if (read_index != write_index) {
+                invalidate_l1_cache();
             }
+
+            if (generation != adopted_generation[i]) {
+                // Drop only descriptors from the old epoch. New-epoch descriptors
+                // may already have been published behind them.
+                while (read_index != write_index) {
+                    const uint32_t slot = read_index & (REALTIME_PROFILER_START_QUEUE_CAPACITY - 1);
+                    const uint32_t descriptor_offset =
+                        (i * REALTIME_PROFILER_START_QUEUE_CAPACITY + slot) * REALTIME_PROFILER_START_DESCRIPTOR_WORDS;
+                    volatile tt_l1_ptr uint32_t* descriptor =
+                        &rt_profiler_msg->start_descriptor_words[descriptor_offset];
+                    if (descriptor[4] == generation || realtime_profiler_generation_after(descriptor[4], generation)) {
+                        break;
+                    }
+                    rt_profiler_msg->reset_descriptor_drop_count++;
+                    read_index++;
+                }
+                rt_profiler_msg->start_descriptor_read_index[i] = read_index;
+                adopted_generation[i] = generation;
+            }
+
+            const uint32_t current_count = *stream_reg & ((1u << MEM_WORD_ADDR_WIDTH) - 1);
+            uint32_t ready_count = 0;
+            uint32_t start_hi = 0;
+            uint32_t start_lo = 0;
+            uint32_t runtime_id = REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID;
+            uint32_t scan_index = read_index;
+            while (scan_index != write_index) {
+                const uint32_t slot = scan_index & (REALTIME_PROFILER_START_QUEUE_CAPACITY - 1);
+                const uint32_t descriptor_offset =
+                    (i * REALTIME_PROFILER_START_QUEUE_CAPACITY + slot) * REALTIME_PROFILER_START_DESCRIPTOR_WORDS;
+                volatile tt_l1_ptr uint32_t* descriptor = &rt_profiler_msg->start_descriptor_words[descriptor_offset];
+                if (descriptor[4] != adopted_generation[i]) {
+                    if (realtime_profiler_generation_after(descriptor[4], adopted_generation[i])) {
+                        break;
+                    }
+                    rt_profiler_msg->reset_descriptor_drop_count++;
+                    scan_index++;
+                    continue;
+                }
+                if (!realtime_profiler_stream_count_ge<MEM_WORD_ADDR_WIDTH>(current_count, descriptor[3])) {
+                    break;
+                }
+                start_hi = descriptor[0];
+                start_lo = descriptor[1];
+                runtime_id = descriptor[2];
+                ready_count++;
+                scan_index++;
+            }
+
+            if (ready_count == 0) {
+                const bool full_with_unmet_head =
+                    scan_index == read_index && read_index != write_index &&
+                    realtime_profiler_queue_full(write_index, read_index, REALTIME_PROFILER_START_QUEUE_CAPACITY);
+                if (full_with_unmet_head && !stuck_head_reported[i]) {
+                    // An impossible target can otherwise look exactly like a
+                    // slow program. Count the head once when it blocks a full
+                    // ring; do not impose a wall-clock timeout on valid work.
+                    rt_profiler_msg->stuck_descriptor_head_count++;
+                    stuck_head_reported[i] = true;
+                } else if (!full_with_unmet_head) {
+                    stuck_head_reported[i] = false;
+                }
+                if (scan_index != read_index) {
+                    rt_profiler_msg->start_descriptor_read_index[i] = scan_index;
+                }
+                continue;
+            }
+
+            stuck_head_reported[i] = false;
+
+            DeviceZoneScopedN("TRISC0-record-end-ts");
+            if (ready_count > 1) {
+                // One sampled tick cannot represent multiple distinct completion
+                // events. Keep only the newest satisfied descriptor.
+                rt_profiler_msg->completion_observer_drop_count += ready_count - 1;
+            }
+
+            uint32_t end_hi = 0;
+            uint32_t end_lo = 0;
+            read_realtime_wall_clock(&end_hi, &end_lo);
+            invalidate_l1_cache();
+            const uint32_t record_write_index = rt_profiler_msg->record_write_index;
+            const uint32_t record_read_index = rt_profiler_msg->record_read_index;
+            if (realtime_profiler_queue_full(
+                    record_write_index, record_read_index, REALTIME_PROFILER_RECORD_QUEUE_CAPACITY)) {
+                rt_profiler_msg->completed_record_drop_count++;
+            } else {
+                const uint32_t record_slot = record_write_index & (REALTIME_PROFILER_RECORD_QUEUE_CAPACITY - 1);
+                volatile tt_l1_ptr uint32_t* record =
+                    &rt_profiler_msg->record_words[record_slot * REALTIME_PROFILER_RECORD_WORDS];
+                const uint32_t sequence = rt_profiler_msg->successful_record_sequence + 1;
+                rt_profiler_msg->successful_record_sequence = sequence;
+                record[0] = start_hi;
+                record[1] = start_lo;
+                record[2] = runtime_id;
+                record[3] = (REALTIME_PROFILER_RECORD_SCHEMA_VERSION << 24) |
+                            (REALTIME_PROFILER_RECORD_TYPE_INTERVAL << 16) | i;
+                record[4] = end_hi;
+                record[5] = end_lo;
+                record[6] = sequence;
+                record[7] =
+                    rt_profiler_msg->start_descriptor_drop_count + rt_profiler_msg->unsupported_launch_drop_count +
+                    rt_profiler_msg->reset_descriptor_drop_count + rt_profiler_msg->completion_observer_drop_count +
+                    rt_profiler_msg->stuck_descriptor_head_count + rt_profiler_msg->completed_record_drop_count;
+                asm volatile("fence w, w" ::: "memory");
+                rt_profiler_msg->record_write_index = record_write_index + 1;
+            }
+            rt_profiler_msg->start_descriptor_read_index[i] = scan_index;
         }
     }
+    asm volatile("fence w, w" ::: "memory");
+    rt_profiler_msg->completion_observer_stopped = 1;
 }
