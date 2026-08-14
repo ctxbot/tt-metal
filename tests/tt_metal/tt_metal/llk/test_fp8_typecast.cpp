@@ -32,19 +32,19 @@ namespace unit_tests::llk::fp8_typecast {
 // The hardware unpacker reads input_fmt and the packer writes output_fmt,
 // performing the format conversion implicitly. fp32_dest_acc_en controls
 // whether the Dest register operates in 32-bit mode.
-static vector<uint32_t> run_fp8_typecast(
+static vector<std::uint32_t> run_fp8_typecast(
     distributed::MeshDevice& mesh_device,
     tt::DataFormat input_fmt,
     tt::DataFormat output_fmt,
-    const vector<uint32_t>& src_vec,
-    uint32_t num_tiles,
+    const vector<std::uint32_t>& src_vec,
+    std::uint32_t num_tiles,
     bool fp32_dest_acc_en) {
     IDevice* dev = mesh_device.get_devices()[0];
     Program program = CreateProgram();
     CoreCoord core = {0, 0};
 
-    uint32_t input_tile_size = tt::tile_size(input_fmt);
-    uint32_t output_tile_size = tt::tile_size(output_fmt);
+    std::uint32_t input_tile_size = tt::tile_size(input_fmt);
+    std::uint32_t output_tile_size = tt::tile_size(output_fmt);
 
     InterleavedBufferConfig src_config{
         .device = dev,
@@ -84,7 +84,12 @@ static vector<uint32_t> run_fp8_typecast(
         program,
         "tests/tt_metal/tt_metal/test_kernels/compute/eltwise_copy_fp8.cpp",
         core,
-        ComputeConfig{.fp32_dest_acc_en = fp32_dest_acc_en, .compile_args = {num_tiles}});
+        ComputeConfig{
+            .fp32_dest_acc_en = fp32_dest_acc_en,
+            // Pass the L1 data formats as compile-time args so the id-free L1MetaData kernel gets them
+            // as constants (thread-agnostic; the chlkc format arrays are thread-partitioned).
+            .compile_args = {
+                num_tiles, static_cast<std::uint32_t>(input_fmt), static_cast<std::uint32_t>(output_fmt)}});
 
     detail::WriteToBuffer(src_buffer, src_vec);
     SetRuntimeArgs(program, reader, core, {src_buffer->address(), 0, num_tiles});
@@ -100,7 +105,7 @@ static vector<uint32_t> run_fp8_typecast(
     distributed::EnqueueMeshWorkload(cq, workload, false);
     distributed::Finish(cq);
 
-    vector<uint32_t> result_vec;
+    vector<std::uint32_t> result_vec;
     detail::ReadFromBuffer(dst_buffer, result_vec);
     return result_vec;
 }
@@ -112,7 +117,7 @@ static vector<uint32_t> run_fp8_typecast(
 using tt::test_utils::bf16_to_floats;
 using tt::test_utils::fp8_to_floats;
 
-static vector<float> bfp8_to_floats(const vector<uint32_t>& packed) {
+static vector<float> bfp8_to_floats(const vector<std::uint32_t>& packed) {
     return unpack_bfp8_tiles_into_float_vec(
         ttsl::make_const_span(packed), /*row_major_output=*/false, /*is_exp_a=*/false);
 }
@@ -136,7 +141,7 @@ using namespace unit_tests::llk::fp8_typecast;
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixFp8e4m3ToFloat16b) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = create_random_vector_of_float8_e4m3(
         tt::tile_size(tt::DataFormat::Fp8_e4m3) * num_tiles, /*rand_max_float=*/20, /*seed=*/42, /*offset=*/-10.0f);
     auto result_vec = run_fp8_typecast(
@@ -161,7 +166,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixFp8e4m3ToFloat16b) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixFloat16bToFp8e4m3) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = create_random_vector_of_bfloat16(
         tt::tile_size(tt::DataFormat::Float16_b) * num_tiles, /*rand_max_float=*/20, /*seed=*/42, /*offset=*/-10.0f);
     auto result_vec = run_fp8_typecast(
@@ -187,7 +192,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixFloat16bToFp8e4m3) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixFp8e4m3ToBfp8b) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = create_random_vector_of_float8_e4m3(
         tt::tile_size(tt::DataFormat::Fp8_e4m3) * num_tiles, /*rand_max_float=*/20, /*seed=*/42, /*offset=*/-10.0f);
     auto result_vec = run_fp8_typecast(
@@ -211,7 +216,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixFp8e4m3ToBfp8b) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixBfp8bToFp8e4m3) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = tt::test_utils::create_random_vector_of_bfp8(
         tt::tile_size(tt::DataFormat::Bfp8_b) * num_tiles,
         /*is_exp_a=*/false,
@@ -241,7 +246,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixBfp8bToFp8e4m3) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixBfp8bToBfp8b) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = tt::test_utils::create_random_vector_of_bfp8(
         tt::tile_size(tt::DataFormat::Bfp8_b) * num_tiles,
         /*is_exp_a=*/false,
@@ -259,7 +264,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixBfp8bToBfp8b) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixBfp8bToBfp8bFp32Dest) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = tt::test_utils::create_random_vector_of_bfp8(
         tt::tile_size(tt::DataFormat::Bfp8_b) * num_tiles,
         /*is_exp_a=*/false,
@@ -283,7 +288,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixBfp8bToBfp8bFp32Dest) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixFp8e4m3ToFp8e4m3) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = create_random_vector_of_float8_e4m3(
         tt::tile_size(tt::DataFormat::Fp8_e4m3) * num_tiles, /*rand_max_float=*/20, /*seed=*/42, /*offset=*/-10.0f);
     auto result_vec = run_fp8_typecast(
@@ -308,7 +313,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixFp8e4m3ToFp8e4m3) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixFloat16bToFloat16b) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = create_random_vector_of_bfloat16(
         tt::tile_size(tt::DataFormat::Float16_b) * num_tiles, /*rand_max_float=*/20, /*seed=*/42, /*offset=*/-10.0f);
     auto result_vec = run_fp8_typecast(
@@ -327,7 +332,7 @@ TEST_F(LLKBlackholeSingleCardFixture, TensixFloat16bToFloat16b) {
 
 TEST_F(LLKBlackholeSingleCardFixture, TensixFloat16bToFloat16bFp32Dest) {
     auto& mesh_device = *devices_[0];
-    constexpr uint32_t num_tiles = 64;
+    constexpr std::uint32_t num_tiles = 64;
     auto src_vec = create_random_vector_of_bfloat16(
         tt::tile_size(tt::DataFormat::Float16_b) * num_tiles, /*rand_max_float=*/20, /*seed=*/42, /*offset=*/-10.0f);
     auto result_vec = run_fp8_typecast(
