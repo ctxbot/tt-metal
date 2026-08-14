@@ -9,12 +9,12 @@
 #include "api/dataflow/dataflow_api.h"
 #endif
 #if defined(COMPILE_FOR_TRISC)
-#include "../kernel_includes/tt_metal/include/compute_kernel_api/deepseek_compute_kernel_hw_startup.h"
+#include "api/compute/experimental/deepseek_compute_kernel_hw_startup.h"
 #endif
 
 // Firmware-set logical coordinates (defined in brisc.cc, ncrisc.cc, trisc.cc)
-extern uint8_t my_logical_x_;
-extern uint8_t my_logical_y_;
+extern std::uint8_t my_logical_x_;
+extern std::uint8_t my_logical_y_;
 
 namespace unified_kernels {
 
@@ -26,29 +26,34 @@ namespace unified_kernels {
 // RowMajor=true:  index = rel_y * grid_width + rel_x  (iterate x first, then y)
 // RowMajor=false: index = rel_x * grid_height + rel_y (iterate y first, then x)
 template <bool RowMajor>
-uint32_t linear_id_in_grid(uint32_t grid_start_x, uint32_t grid_start_y, uint32_t grid_end_x, uint32_t grid_end_y) {
-    uint32_t rel_x = my_logical_x_ - grid_start_x;
-    uint32_t rel_y = my_logical_y_ - grid_start_y;
+std::uint32_t linear_id_in_grid(
+    std::uint32_t grid_start_x, std::uint32_t grid_start_y, std::uint32_t grid_end_x, std::uint32_t grid_end_y) {
+    std::uint32_t rel_x = my_logical_x_ - grid_start_x;
+    std::uint32_t rel_y = my_logical_y_ - grid_start_y;
     if constexpr (RowMajor) {
-        uint32_t grid_width = grid_end_x - grid_start_x + 1;
+        std::uint32_t grid_width = grid_end_x - grid_start_x + 1;
         return rel_y * grid_width + rel_x;
     } else {
-        uint32_t grid_height = grid_end_y - grid_start_y + 1;
+        std::uint32_t grid_height = grid_end_y - grid_start_y + 1;
         return rel_x * grid_height + rel_y;
     }
 }
 
 struct SplitHalfCoreInfo {
     bool is_half0;
-    uint32_t half_local_idx;
+    std::uint32_t half_local_idx;
 };
 
 template <bool RowMajor>
 SplitHalfCoreInfo get_split_half_core_info(
-    uint32_t grid_start_x, uint32_t grid_start_y, uint32_t grid_end_x, uint32_t grid_end_y, uint32_t half_num_cores) {
-    const uint32_t linear_idx = linear_id_in_grid<RowMajor>(grid_start_x, grid_start_y, grid_end_x, grid_end_y);
+    std::uint32_t grid_start_x,
+    std::uint32_t grid_start_y,
+    std::uint32_t grid_end_x,
+    std::uint32_t grid_end_y,
+    std::uint32_t half_num_cores) {
+    const std::uint32_t linear_idx = linear_id_in_grid<RowMajor>(grid_start_x, grid_start_y, grid_end_x, grid_end_y);
     const bool is_half0 = linear_idx < half_num_cores;
-    const uint32_t half_local_idx = is_half0 ? linear_idx : (linear_idx - half_num_cores);
+    const std::uint32_t half_local_idx = is_half0 ? linear_idx : (linear_idx - half_num_cores);
     return {is_half0, half_local_idx};
 }
 
@@ -61,18 +66,18 @@ SplitHalfCoreInfo get_split_half_core_info(
 // Setup a sharded persistent buffer by reserving and pushing tiles
 // This makes the buffer available for compute to read from
 // Note: Can be called from either NCRISC or BRISC, whichever runs first
-FORCE_INLINE void setup_sharded_buffer(uint32_t cb_id, uint32_t num_tiles) {
+FORCE_INLINE void setup_sharded_buffer(std::uint32_t cb_id, std::uint32_t num_tiles) {
     cb_reserve_back(cb_id, num_tiles);
     cb_push_back(cb_id, num_tiles);
 }
 
 // Atomic semaphore decrement (for global semaphore reset across iterations)
-FORCE_INLINE void semaphore_dec(volatile tt_l1_ptr uint32_t* sem_addr, uint32_t val = 1) {
+FORCE_INLINE void semaphore_dec(volatile tt_l1_ptr std::uint32_t* sem_addr, std::uint32_t val = 1) {
     __atomic_fetch_sub(sem_addr, val, __ATOMIC_RELEASE);
 }
 
 // Atomic semaphore increment
-FORCE_INLINE void semaphore_inc(volatile tt_l1_ptr uint32_t* sem_addr, uint32_t val = 1) {
+FORCE_INLINE void semaphore_inc(volatile tt_l1_ptr std::uint32_t* sem_addr, std::uint32_t val = 1) {
     __atomic_fetch_add(sem_addr, val, __ATOMIC_RELEASE);
 }
 
@@ -84,14 +89,14 @@ FORCE_INLINE void semaphore_inc(volatile tt_l1_ptr uint32_t* sem_addr, uint32_t 
 // (ACQUIRE) so subsequent reads can't be hoisted before the load; DEC uses
 // RELEASE since the dec often signals downstream consumers (gather_sync_sem,
 // partial_sem, fmt_sync::consumer_release).
-FORCE_INLINE uint32_t sem_atomic_load(uint32_t sem_addr) {
-    return __atomic_load_n(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr), __ATOMIC_ACQUIRE);
+FORCE_INLINE std::uint32_t sem_atomic_load(std::uint32_t sem_addr) {
+    return __atomic_load_n(reinterpret_cast<volatile tt_l1_ptr std::uint32_t*>(sem_addr), __ATOMIC_ACQUIRE);
 }
-FORCE_INLINE void sem_atomic_inc(uint32_t sem_addr, uint32_t v = 1) {
-    __atomic_fetch_add(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr), v, __ATOMIC_RELEASE);
+FORCE_INLINE void sem_atomic_inc(std::uint32_t sem_addr, std::uint32_t v = 1) {
+    __atomic_fetch_add(reinterpret_cast<volatile tt_l1_ptr std::uint32_t*>(sem_addr), v, __ATOMIC_RELEASE);
 }
-FORCE_INLINE void sem_atomic_dec(uint32_t sem_addr, uint32_t v = 1) {
-    __atomic_fetch_sub(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr), v, __ATOMIC_RELEASE);
+FORCE_INLINE void sem_atomic_dec(std::uint32_t sem_addr, std::uint32_t v = 1) {
+    __atomic_fetch_sub(reinterpret_cast<volatile tt_l1_ptr std::uint32_t*>(sem_addr), v, __ATOMIC_RELEASE);
 }
 
 // ============================================================================
@@ -117,7 +122,7 @@ FORCE_INLINE void sem_atomic_dec(uint32_t sem_addr, uint32_t v = 1) {
 //                  then subtract 1. The last one drains high to 0 for next iteration.
 
 template <bool sync_math_risc = true, bool sync_tensix = true>
-FORCE_INLINE void sync_riscs_enter(volatile uint32_t tt_l1_ptr* sem_addr) {
+FORCE_INLINE void sync_riscs_enter(volatile std::uint32_t tt_l1_ptr* sem_addr) {
 #if defined(UCK_CHLKC_MATH)
     if constexpr (sync_math_risc)
 #endif
@@ -130,7 +135,7 @@ FORCE_INLINE void sync_riscs_enter(volatile uint32_t tt_l1_ptr* sem_addr) {
 #endif
         __atomic_fetch_add(&sem_addr[0], 1, __ATOMIC_RELEASE);
 #elif defined(COMPILE_FOR_NCRISC)
-        constexpr uint32_t sync_value = sync_math_risc ? 4 : 3;
+        constexpr std::uint32_t sync_value = sync_math_risc ? 4 : 3;
         while ((__atomic_load_n(&sem_addr[0], __ATOMIC_ACQUIRE) & 0xFFFF) < sync_value) {
         }
         __atomic_fetch_sub(&sem_addr[0], sync_value, __ATOMIC_RELEASE);
@@ -139,13 +144,13 @@ FORCE_INLINE void sync_riscs_enter(volatile uint32_t tt_l1_ptr* sem_addr) {
 }
 
 template <bool sync_math_risc = true>
-FORCE_INLINE void sync_riscs_exit(volatile uint32_t tt_l1_ptr* sem_addr) {
+FORCE_INLINE void sync_riscs_exit(volatile std::uint32_t tt_l1_ptr* sem_addr) {
 #if defined(UCK_CHLKC_MATH)
     if constexpr (sync_math_risc)
 #endif
     {
 #if defined(COMPILE_FOR_NCRISC)
-        constexpr uint32_t sync_value = sync_math_risc ? 4 : 3;
+        constexpr std::uint32_t sync_value = sync_math_risc ? 4 : 3;
         __atomic_fetch_add(&sem_addr[0], sync_value << 16, __ATOMIC_RELEASE);
 #elif defined(COMPILE_FOR_BRISC) || defined(COMPILE_FOR_TRISC)
         while ((__atomic_load_n(&sem_addr[0], __ATOMIC_ACQUIRE) >> 16) == 0) {
@@ -162,7 +167,7 @@ FORCE_INLINE void sync_riscs_exit(volatile uint32_t tt_l1_ptr* sem_addr) {
 #if defined(COMPILE_FOR_TRISC)
 
 // Read a CB's current read pointer as a byte address.
-FORCE_INLINE uint32_t get_cb_rd_ptr(uint32_t cb_id) {
+FORCE_INLINE std::uint32_t get_cb_rd_ptr(std::uint32_t cb_id) {
     return get_local_cb_interface(cb_id).fifo_rd_ptr << cb_addr_shift;
 }
 
@@ -170,23 +175,23 @@ FORCE_INLINE uint32_t get_cb_rd_ptr(uint32_t cb_id) {
 // push/pop and loop iterations. LocalCBInterface stores fifo_limit and
 // fifo_size; init sets fifo_limit = fifo_addr + fifo_size (see
 // tt_metal/hw/inc/internal/circular_buffer_init.h), so base = fifo_limit - fifo_size.
-FORCE_INLINE uint32_t get_cb_buf_addr(uint32_t cb_id) {
+FORCE_INLINE std::uint32_t get_cb_buf_addr(std::uint32_t cb_id) {
     auto& cb = get_local_cb_interface(cb_id);
     return (cb.fifo_limit - cb.fifo_size) << cb_addr_shift;
 }
 
 // Read a CB's page size in bytes.
-FORCE_INLINE uint32_t get_cb_page_size(uint32_t cb_id) {
+FORCE_INLINE std::uint32_t get_cb_page_size(std::uint32_t cb_id) {
     return get_local_cb_interface(cb_id).fifo_page_size << cb_addr_shift;
 }
 
 // Override a CB's read pointer to a byte address (converted to cb_addr_shift units).
-FORCE_INLINE void override_cb_rd_ptr(uint32_t cb_id, uint32_t byte_address) {
+FORCE_INLINE void override_cb_rd_ptr(std::uint32_t cb_id, std::uint32_t byte_address) {
     get_local_cb_interface(cb_id).fifo_rd_ptr = byte_address >> cb_addr_shift;
 }
 
 // Override a CB's write pointer to a byte address (converted to cb_addr_shift units).
-FORCE_INLINE void override_cb_wr_ptr(uint32_t cb_id, uint32_t byte_address) {
+FORCE_INLINE void override_cb_wr_ptr(std::uint32_t cb_id, std::uint32_t byte_address) {
     get_local_cb_interface(cb_id).fifo_wr_ptr = byte_address >> cb_addr_shift;
     get_local_cb_interface(cb_id).fifo_wr_tile_ptr = 0;
 }
@@ -211,15 +216,16 @@ FORCE_INLINE void override_cb_wr_ptr(uint32_t cb_id, uint32_t byte_address) {
 //   TRISC0/unpack: read=true,  write=false
 //   TRISC2/pack:   read=false, write=true
 template <bool do_read, bool do_write, bool do_write_tile_ptr, bool do_reset_stream_regs>
-FORCE_INLINE void reconfig_cbs_for_mask(uint32_t tt_l1_ptr* cb_config, uint32_t mask, uint32_t start_cb) {
-    uint32_t cb = start_cb;
+FORCE_INLINE void reconfig_cbs_for_mask(
+    std::uint32_t tt_l1_ptr* cb_config, std::uint32_t mask, std::uint32_t start_cb) {
+    std::uint32_t cb = start_cb;
     while (mask) {
         if (mask & 1) {
-            uint32_t base = cb * 4;
-            uint32_t fifo_addr = cb_config[base + 0] >> cb_addr_shift;
-            uint32_t fifo_size = cb_config[base + 1] >> cb_addr_shift;
-            uint32_t fifo_num_pages = cb_config[base + 2];
-            uint32_t fifo_page_size = cb_config[base + 3] >> cb_addr_shift;
+            std::uint32_t base = cb * 4;
+            std::uint32_t fifo_addr = cb_config[base + 0] >> cb_addr_shift;
+            std::uint32_t fifo_size = cb_config[base + 1] >> cb_addr_shift;
+            std::uint32_t fifo_num_pages = cb_config[base + 2];
+            std::uint32_t fifo_page_size = cb_config[base + 3] >> cb_addr_shift;
 
             LocalCBInterface& iface = get_local_cb_interface(cb);
             if constexpr (do_read) {
@@ -247,7 +253,7 @@ FORCE_INLINE void reconfig_cbs_for_mask(uint32_t tt_l1_ptr* cb_config, uint32_t 
     }
 }
 
-FORCE_INLINE void reconfig_cb_interfaces(uint32_t tt_l1_ptr* cb_config) {
+FORCE_INLINE void reconfig_cb_interfaces(std::uint32_t tt_l1_ptr* cb_config) {
 #if defined(COMPILE_FOR_NCRISC) or defined(COMPILE_FOR_BRISC) or defined(UCK_CHLKC_UNPACK) or defined(UCK_CHLKC_PACK)
 #if defined(COMPILE_FOR_NCRISC)
     constexpr bool do_read = true;
@@ -271,7 +277,8 @@ FORCE_INLINE void reconfig_cb_interfaces(uint32_t tt_l1_ptr* cb_config) {
     constexpr bool do_reset_stream_regs = false;
 #endif
 
-    volatile uint32_t tt_l1_ptr* reconfig_sem = reinterpret_cast<volatile uint32_t tt_l1_ptr*>(&cb_config[258]);
+    volatile std::uint32_t tt_l1_ptr* reconfig_sem =
+        reinterpret_cast<volatile std::uint32_t tt_l1_ptr*>(&cb_config[258]);
     sync_riscs_enter<false>(reconfig_sem);
 
     reconfig_cbs_for_mask<do_read, do_write, do_write_tile_ptr, do_reset_stream_regs>(cb_config, cb_config[256], 0);
@@ -285,17 +292,17 @@ FORCE_INLINE void reconfig_cb_interfaces(uint32_t tt_l1_ptr* cb_config) {
 
 #if defined(COMPILE_FOR_TRISC)
 // Helper functions to manipulate CB read pointer (from bmm_large_block_zm_fused_bias_activation_gathered.cpp)
-FORCE_INLINE uint32_t get_local_cb_rd_ptr(uint32_t cb_id) {
+FORCE_INLINE std::uint32_t get_local_cb_rd_ptr(std::uint32_t cb_id) {
     LocalCBInterface& local_cb = get_local_cb_interface(cb_id);
     return local_cb.fifo_rd_ptr;
 }
 
-FORCE_INLINE uint32_t get_local_cb_page_size(uint32_t cb_id) {
+FORCE_INLINE std::uint32_t get_local_cb_page_size(std::uint32_t cb_id) {
     LocalCBInterface& local_cb = get_local_cb_interface(cb_id);
     return local_cb.fifo_page_size;
 }
 
-FORCE_INLINE void update_local_cb_rd_ptr(uint32_t cb_id, uint32_t val) {
+FORCE_INLINE void update_local_cb_rd_ptr(std::uint32_t cb_id, std::uint32_t val) {
     LocalCBInterface& local_cb = get_local_cb_interface(cb_id);
     local_cb.fifo_rd_ptr = val;
 }

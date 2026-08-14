@@ -17,7 +17,7 @@
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/bcast.h"
 #include "api/compute/experimental/eltwise_mul_scalar.h"
-#include "../kernel_includes/tt_metal/include/compute_kernel_api/deepseek_compute_kernel_hw_startup.h"
+#include "api/compute/experimental/deepseek_compute_kernel_hw_startup.h"
 using namespace ckernel;
 #endif
 
@@ -54,21 +54,21 @@ struct EltwiseMul {
     //              scalar tile per expert into cb_scalar. cb_scalar_src is popped once
     //              after all scalars are read.
     template <
-        uint32_t cb_out_,
-        uint32_t num_tiles_,
-        uint32_t cb_scalar_,
-        uint32_t cb_scalar_src_,
-        uint32_t scalar_index_offset_,
-        uint32_t enable_scalar_ = 1,
-        uint32_t num_experts_ = 1>
+        std::uint32_t cb_out_,
+        std::uint32_t num_tiles_,
+        std::uint32_t cb_scalar_,
+        std::uint32_t cb_scalar_src_,
+        std::uint32_t scalar_index_offset_,
+        std::uint32_t enable_scalar_ = 1,
+        std::uint32_t num_experts_ = 1>
     struct WriterCTArgs {
-        static constexpr uint32_t cb_out = cb_out_;
-        static constexpr uint32_t num_tiles = num_tiles_;
-        static constexpr uint32_t cb_scalar = cb_scalar_;
-        static constexpr uint32_t cb_scalar_src = cb_scalar_src_;
-        static constexpr uint32_t scalar_index_offset = scalar_index_offset_;  // offset into scalar source tensor
+        static constexpr std::uint32_t cb_out = cb_out_;
+        static constexpr std::uint32_t num_tiles = num_tiles_;
+        static constexpr std::uint32_t cb_scalar = cb_scalar_;
+        static constexpr std::uint32_t cb_scalar_src = cb_scalar_src_;
+        static constexpr std::uint32_t scalar_index_offset = scalar_index_offset_;  // offset into scalar source tensor
         static constexpr bool enable_scalar = enable_scalar_ == 1;
-        static constexpr uint32_t num_experts = num_experts_;
+        static constexpr std::uint32_t num_experts = num_experts_;
     };
 
     // Compute CTArgs (TRISC)
@@ -81,31 +81,31 @@ struct EltwiseMul {
     //              on cb_in0/cb_in1 and pushes num_tiles to cb_out. Init calls run
     //              once outside the loop; tile_regs lifecycle is per-expert.
     template <
-        uint32_t cb_in0_,
-        uint32_t cb_in1_,
-        uint32_t cb_out_,
-        uint32_t num_tiles_,
-        uint32_t cb_in0_wait_,
-        uint32_t cb_in0_wait_tiles_,
-        uint32_t cb_in1_wait_,
-        uint32_t cb_in1_wait_tiles_,
-        uint32_t cb_scalar_,
-        uint32_t fp32_dest_acc_en_ = 0,
-        uint32_t enable_scalar_ = 1,
-        uint32_t num_experts_ = 1>
+        std::uint32_t cb_in0_,
+        std::uint32_t cb_in1_,
+        std::uint32_t cb_out_,
+        std::uint32_t num_tiles_,
+        std::uint32_t cb_in0_wait_,
+        std::uint32_t cb_in0_wait_tiles_,
+        std::uint32_t cb_in1_wait_,
+        std::uint32_t cb_in1_wait_tiles_,
+        std::uint32_t cb_scalar_,
+        std::uint32_t fp32_dest_acc_en_ = 0,
+        std::uint32_t enable_scalar_ = 1,
+        std::uint32_t num_experts_ = 1>
     struct ComputeCTArgs {
-        static constexpr uint32_t cb_in0 = cb_in0_;
-        static constexpr uint32_t cb_in1 = cb_in1_;
-        static constexpr uint32_t cb_out = cb_out_;
-        static constexpr uint32_t num_tiles = num_tiles_;
-        static constexpr uint32_t cb_in0_wait = cb_in0_wait_;
-        static constexpr uint32_t cb_in0_wait_tiles = cb_in0_wait_tiles_;
-        static constexpr uint32_t cb_in1_wait = cb_in1_wait_;
-        static constexpr uint32_t cb_in1_wait_tiles = cb_in1_wait_tiles_;
-        static constexpr uint32_t cb_scalar = cb_scalar_;
+        static constexpr std::uint32_t cb_in0 = cb_in0_;
+        static constexpr std::uint32_t cb_in1 = cb_in1_;
+        static constexpr std::uint32_t cb_out = cb_out_;
+        static constexpr std::uint32_t num_tiles = num_tiles_;
+        static constexpr std::uint32_t cb_in0_wait = cb_in0_wait_;
+        static constexpr std::uint32_t cb_in0_wait_tiles = cb_in0_wait_tiles_;
+        static constexpr std::uint32_t cb_in1_wait = cb_in1_wait_;
+        static constexpr std::uint32_t cb_in1_wait_tiles = cb_in1_wait_tiles_;
+        static constexpr std::uint32_t cb_scalar = cb_scalar_;
         static constexpr bool fp32_dest_acc_en = fp32_dest_acc_en_ == 1;
         static constexpr bool enable_scalar = enable_scalar_ == 1;
-        static constexpr uint32_t num_experts = num_experts_;
+        static constexpr std::uint32_t num_experts = num_experts_;
     };
 
     // ========================================================================
@@ -141,15 +141,16 @@ struct EltwiseMul {
                 // scalar_index_offset + e.
                 cb_wait_front(CTArgs::cb_scalar_src, 1);
 
-                uint32_t cb_read_addr = get_read_ptr(CTArgs::cb_scalar_src);
-                volatile tt_l1_ptr uint16_t* src_ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cb_read_addr);
+                std::uint32_t cb_read_addr = get_read_ptr(CTArgs::cb_scalar_src);
+                volatile tt_l1_ptr std::uint16_t* src_ptr =
+                    reinterpret_cast<volatile tt_l1_ptr std::uint16_t*>(cb_read_addr);
 
                 // cb_scalar holds num_experts pages; get_write_ptr advances each push,
                 // so recompute the dst pointer per iteration.
-                for (uint32_t e = 0; e < CTArgs::num_experts; e++) {
+                for (std::uint32_t e = 0; e < CTArgs::num_experts; e++) {
                     cb_reserve_back(CTArgs::cb_scalar, 1);
-                    volatile tt_l1_ptr uint16_t* dst_ptr =
-                        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(CTArgs::cb_scalar));
+                    volatile tt_l1_ptr std::uint16_t* dst_ptr =
+                        reinterpret_cast<volatile tt_l1_ptr std::uint16_t*>(get_write_ptr(CTArgs::cb_scalar));
                     dst_ptr[0] = src_ptr[CTArgs::scalar_index_offset + e];
                     cb_push_back(CTArgs::cb_scalar, 1);
                 }
@@ -172,9 +173,9 @@ struct EltwiseMul {
             //
             // Assumes total_tiles <= DST capacity (8 in fp32-accum, 16 in bf16).
             // ================================================================
-            constexpr uint32_t num_tiles = CTArgs::num_tiles;
-            constexpr uint32_t num_experts = CTArgs::num_experts;
-            constexpr uint32_t total_tiles = num_tiles * num_experts;
+            constexpr std::uint32_t num_tiles = CTArgs::num_tiles;
+            constexpr std::uint32_t num_experts = CTArgs::num_experts;
+            constexpr std::uint32_t total_tiles = num_tiles * num_experts;
             static_assert(total_tiles <= 8, "total_tiles must fit in DST (fp32-accum capacity = 8)");
 
             // Wait for all experts' inputs.
@@ -200,17 +201,17 @@ struct EltwiseMul {
                 // Step 1: in0[idx] * scalar[e] -> dest[idx] (idx = e*num_tiles + i)
                 // Wait one scalar at a time so math can start as soon as BRISC
                 // pushes the e-th page (cb_wait_front is cumulative; no pop mid-loop).
-                for (uint32_t e = 0; e < num_experts; e++) {
+                for (std::uint32_t e = 0; e < num_experts; e++) {
                     cb_wait_front(CTArgs::cb_scalar, e + 1);
-                    for (uint32_t i = 0; i < num_tiles; i++) {
-                        uint32_t idx = e * num_tiles + i;
+                    for (std::uint32_t i = 0; i < num_tiles; i++) {
+                        std::uint32_t idx = e * num_tiles + i;
                         deepseek_mul_tiles_bcast_scalar<CTArgs::fp32_dest_acc_en>(
                             CTArgs::cb_in0, CTArgs::cb_scalar, idx, e, idx);
                     }
                 }
                 // Step 2: dest[idx] *= in1[idx] across all experts (init once, pre-loop)
                 deepseek_binary_dest_reuse_tiles_init(CTArgs::cb_in1);
-                for (uint32_t idx = 0; idx < total_tiles; idx++) {
+                for (std::uint32_t idx = 0; idx < total_tiles; idx++) {
                     deepseek_binary_dest_reuse_tiles<CTArgs::fp32_dest_acc_en>(CTArgs::cb_in1, idx, idx);
                 }
             } else {
@@ -221,14 +222,14 @@ struct EltwiseMul {
 
                 tile_regs_acquire();
 
-                for (uint32_t idx = 0; idx < total_tiles; idx++) {
+                for (std::uint32_t idx = 0; idx < total_tiles; idx++) {
                     mul_tiles(CTArgs::cb_in0, CTArgs::cb_in1, idx, idx, idx);
                 }
             }
 
             tile_regs_commit();
             tile_regs_wait();
-            for (uint32_t idx = 0; idx < total_tiles; idx++) {
+            for (std::uint32_t idx = 0; idx < total_tiles; idx++) {
                 pack_tile(idx, CTArgs::cb_out);
             }
             tile_regs_release();
