@@ -189,7 +189,7 @@ void kernel_main() {
     }
     // Normalize x with the gathered reciprocal RMS, then apply gamma.
     ckl::mul<
-        ckl::input(dfb_xmm_id, ckl::WaitPolicy::Upfront, ckl::PopPolicy::AtEnd, ckl::OperandKind::Block),
+        ckl::input(dfb_xmm_id, ckl::WaitPolicy::None, ckl::PopPolicy::AtEnd, ckl::OperandKind::Block),
         ckl::input(dfb_ex_global_id, ckl::BroadcastDim::Col, ckl::WaitPolicy::Upfront, ckl::PopPolicy::AtEnd),
         ckl::output(dfb_im_id, ckl::ReservePolicy::Upfront, ckl::PushPolicy::AtEnd)>(
         ckl::IterationShape::tiles(num_tiles_per_block).block_size(subblock_w));

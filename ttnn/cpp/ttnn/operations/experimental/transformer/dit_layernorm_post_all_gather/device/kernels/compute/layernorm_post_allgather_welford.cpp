@@ -56,10 +56,9 @@ void kernel_main() {
 
     DataflowBuffer(dfb_eps_id).wait_front(1);
 
-    // combine_welford_partials takes DataflowBuffer& (stateless wrappers over the DFB id);
-    // the raw uint32_t ids above are still used for the eltwise_chain template args and dfb_* calls.
-    DataflowBuffer dfb_stats_id(dfb_stats_id);
-    DataflowBuffer dfb_stats_reduced_id(dfb_stats_reduced_id);
+    // combine_welford_partials takes DataflowBuffer&, while the eltwise chains require raw DFB ids.
+    DataflowBuffer dfb_stats(dfb_stats_id);
+    DataflowBuffer dfb_stats_reduced(dfb_stats_reduced_id);
 
     for (uint32_t tile_row = 0; tile_row < num_tile_rows; tile_row++) {
         // Calculate global tile row and batch index
@@ -67,13 +66,13 @@ void kernel_main() {
         uint32_t batch_idx = global_tile_row / Ht;
         // Combine per-device stats into mean/variance
         norm::kernel_util::compute::combine_welford_partials(
-            dfb_stats_id,
-            dfb_stats_reduced_id,
+            dfb_stats,
+            dfb_stats_reduced,
             num_devices,
             [W](uint32_t) { return (static_cast<float>(W)); },
             norm::kernel_util::compute::RSqrtPolicy{false, 0});
-        DataflowBuffer(dfb_stats_reduced_id).push_back(stats_tile_stride);
-        DataflowBuffer(dfb_stats_reduced_id).wait_front(stats_tile_stride);
+        dfb_stats_reduced.push_back(stats_tile_stride);
+        dfb_stats_reduced.wait_front(stats_tile_stride);
 
         // combine_welford_partials stores [mean, variance]; tile 1 supplies variance.
         ckl::eltwise_chain(
@@ -160,7 +159,7 @@ void kernel_main() {
         }
 
         // free up per-row resources
-        DataflowBuffer(dfb_stats_reduced_id).pop_front(stats_tile_stride);
+        dfb_stats_reduced.pop_front(stats_tile_stride);
         DataflowBuffer(dfb_recip_sqrt_var_id).pop_front(1);
 
         // Check if next tile_row is in a different batch - if so, pop gamma/beta
