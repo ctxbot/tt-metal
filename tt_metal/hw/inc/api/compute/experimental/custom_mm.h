@@ -5,13 +5,16 @@
 #pragma once
 
 #include "api/compute/common.h"
-#ifdef TRISC_MATH
-#include "../../hw/ckernels/blackhole/metal/llk_api/llk_math_custom_mm_api.h"
+// Blackhole-only: the custom_mm LLKs live only in the Blackhole llk_api / llk_lib trees.
+#if defined(TRISC_MATH) && defined(ARCH_BLACKHOLE)
+#include "experimental/llk_math_custom_mm_api.h"
 #endif
-#ifdef TRISC_UNPACK
-#include "../../hw/ckernels/blackhole/metal/llk_api/llk_unpack_AB_custom_mm_api.h"
+#if defined(TRISC_UNPACK) && defined(ARCH_BLACKHOLE)
+#include "experimental/llk_unpack_AB_custom_mm_api.h"
 #endif
 namespace ckernel {
+
+#if defined(ARCH_BLACKHOLE)
 
 // clang-format off
 /**
@@ -40,7 +43,11 @@ namespace ckernel {
  * | ct_dim         | The width of the output matrix in tiles                                                | uint32_t | 1 to 16                               | False (default 1)     |
  */
 // clang-format on
-template <bool transpose = false, bool split_acc = false, bool dense_packing = false, bool fp32_dest_acc_en = DST_ACCUM_MODE>
+template <
+    bool transpose = false,
+    bool split_acc = false,
+    bool dense_packing = false,
+    bool fp32_dest_acc_en = DST_ACCUM_MODE>
 ALWI void custom_mm_block_init(
     const std::uint32_t in0_cb_id,
     const std::uint32_t in1_cb_id,
@@ -241,17 +248,31 @@ ALWI void custom_mm_block_math(
  *
  * Return value: None
  *
- * | Argument       | Description                                                                            | Type     | Valid Range                  | Required              |
- * |----------------|----------------------------------------------------------------------------------------|----------|------------------------------|-----------------------|
- * | dense_packing  | Whether to pack consecutive tiles 32 rows apart (instead of 64, doubles dest capacity) | bool     | true/false                   | False (default false) |
+ * | Argument              | Description                                                                            | Type     | Valid Range                  | Required              |
+ * |-----------------------|----------------------------------------------------------------------------------------|----------|------------------------------|-----------------------|
+ * | dense_packing         | Whether to pack consecutive tiles 32 rows apart (instead of 64, doubles dest capacity) | bool     | true/false                   | False (default false) |
+ * | restore_tile_pack_mop | Reinstall the default (32x32-tile, 4-face) tile-pack MOP on exit                       | bool     | true/false                   | False (default false) |
  */
 // clang-format on
-template <bool dense_packing = false>
+template <bool dense_packing = false, bool restore_tile_pack_mop = false>
 ALWI void custom_mm_block_uninit() {
     if constexpr (dense_packing) {
         // Restore default packing stride of 64 rows between tiles
         PACK((cfg_reg_rmw_tensix<PCK0_ADDR_CTRL_ZW_REG_0_Wstride_RMW>(TILE_NUM_FACES * FACE_C_DIM * FACE_R_DIM * 2)));
     }
+    if constexpr (restore_tile_pack_mop) {
+        // Opt-in for callers following the "leave the packer at Default on op exit" convention
+        // (tt-blaze fused chains, where light follow-on ops pack without re-initing). Note this
+        // installs fixed 32x32 tile geometry — wrong for 1x32 follow-ons, which must re-init.
+        PACK((_llk_pack_mop_config_<PackMode::Default>()));
+    }
+    // Otherwise deliberately no packer-MOP write: the MOP is owned by whichever init programmed
+    // it (llk_pack_init derives tile geometry from the output CB, and some fused callers
+    // intentionally inherit the block-contiguous MOP across ops). A no-arg
+    // _llk_pack_mop_config_<Default>() would install fixed 32x32 geometry and clobber the
+    // 1x32 configuration this family targets.
 }
+
+#endif  // ARCH_BLACKHOLE
 
 }  // namespace ckernel
