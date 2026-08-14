@@ -14,8 +14,10 @@
 # one suite across machines, pytest-split style. Give each machine its own
 # --report-dir.
 #
-# Env (see README): TTNOP_DELAYS TTNOP_THREADS TTNOP_SITE_MODE TTNOP_FILLER
-# Markers also accepted via PYTEST_MARKERS / TTNOP_MARKERS (CI sets PYTEST_MARKERS).
+# Defaults (same as the bit-exact workflow): unpack+math, sync sites,
+# delays 1-100, filler auto. Override via TTNOP_DELAYS / TTNOP_THREADS /
+# TTNOP_SITE_MODE / TTNOP_FILLER if you need to. A pasted TTNOP_FOO=bar is
+# exported rather than rejected. Markers via PYTEST_MARKERS / TTNOP_MARKERS.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
@@ -43,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --report-dir) REPORT_DIR="$2"; shift 2 ;;
         --collect-to) COLLECT_TO="$2"; shift 2 ;;
         --nodeids) NODEIDS="$2"; shift 2 ;;
+        TTNOP_*=*|CHIP_ARCH=*) export "$1"; shift ;;
         *) echo "ttnop: unknown option $1" >&2; exit 4 ;;
     esac
 done
@@ -52,6 +55,9 @@ if [[ ${#TESTS[@]} -eq 0 && -z "$NODEIDS" ]]; then
     exit 4
 fi
 
+# Anchor to this directory before the cd below, or pytest resolves a relative
+# --report-dir against python_tests/ and the reports land outside ttnop/.
+[[ "$REPORT_DIR" = /* ]] || REPORT_DIR="$HERE/$REPORT_DIR"
 export TTNOP_REPORT_DIR="$REPORT_DIR"
 build_scanner
 cd "$PYTHON_TESTS"
