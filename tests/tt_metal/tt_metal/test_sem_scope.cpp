@@ -48,7 +48,14 @@ protected:
     const std::string kernel_path_concurrent = "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_concurrent.cpp";
     const std::string kernel_path_coexist = "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_coexist.cpp";
     const std::string kernel_path_census = "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_census_probe.cpp";
-    const std::string kernel_path_remote = "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_remote.cpp";
+    const std::string kernel_path_remote_sender =
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_remote_sender.cpp";
+    const std::string kernel_path_remote_receiver =
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_remote_receiver.cpp";
+    const std::string kernel_path_readonly_observer =
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_readonly_observer.cpp";
+    const std::string kernel_path_local_writer =
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_local_writer_probe.cpp";
     const std::string kernel_path_slot_probe = "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_slot_probe.cpp";
     uint32_t report_addr{0};
     uint32_t num_dms_{0};
@@ -396,9 +403,8 @@ protected:
         const experimental::KernelSpecName RECEIVER{"sem_remote_receiver"};
         experimental::KernelSpec sender_spec{
             .unique_id = SENDER,
-            .source = kernel_path_remote,
+            .source = kernel_path_remote_sender,
             .num_threads = sender_threads,
-            .compiler_options = {.defines = {{"REMOTE_SENDER", "1"}}},
             .semaphore_bindings =
                 {{.semaphore_spec_name = experimental::SemaphoreSpecName{"counter_sem"}, .accessor_name = "counter"}},
             .runtime_arg_schema = {.runtime_arg_names = {"increment_times", "remote_noc_x", "remote_noc_y"}},
@@ -406,7 +412,7 @@ protected:
         };
         experimental::KernelSpec receiver_spec{
             .unique_id = RECEIVER,
-            .source = kernel_path_remote,
+            .source = kernel_path_remote_receiver,
             .num_threads = 1,
             .semaphore_bindings =
                 {{.semaphore_spec_name = experimental::SemaphoreSpecName{"counter_sem"}, .accessor_name = "counter"}},
@@ -765,8 +771,10 @@ TEST_F(SemScopeFixture, TestCachedExternalCoexistence) {
 // manifests as a hang; the exact-count EXPECTs catch overshoot and wrong-word landings.
 
 // One off-node sender thread. Exact count proves remote up() reaches the semaphore's word and
-// loses nothing; the scope report proves the census demoted the off-node-written semaphore to
-// EXTERNAL (any local mechanism would split or lose the remote increments).
+// loses nothing; the scope report proves an off-node WRITER keeps the semaphore EXTERNAL (the
+// access-scan refinement applies only to on-node sole writers -- the posted-write fast path for
+// off-node sole writers is deferred: its write primitive hangs on the Quasar RTL, see the
+// refinement comment in program_spec.cpp).
 TEST_F(SemScopeFixture, TestExternalRemoteUpExactCount) {
     if (!has_second_node()) {
         GTEST_SKIP() << "needs >= 2 worker nodes for an off-node sender";
@@ -774,7 +782,7 @@ TEST_F(SemScopeFixture, TestExternalRemoteUpExactCount) {
     const auto [scope, value] = run_remote(/*sender_threads=*/1, iterations);
     log_info(LogTest, "EXTERNAL remote up: scope={} value={} (expected {})", scope, value, iterations);
     EXPECT_EQ(scope, scope_val(SemScope::EXTERNAL))
-        << "the census must resolve an off-node-written semaphore to EXTERNAL in both kernels";
+        << "an off-node writer must keep the semaphore EXTERNAL (no posted fast path yet)";
     EXPECT_EQ(value, iterations)
         << "Semaphore::up(noc, x, y, 1) from an off-node single sender overshot or hit the wrong word "
            "(a LOST increment would hang in the receiver's wait_min, not fail here).";
@@ -808,6 +816,69 @@ TEST_F(SemScopeFixture, TestExternalRemoteUpConcurrentExactCount) {
 // ============================================================================
 
 // 1 writer instance on a single-cell semaphore -> nothing can race -> cheapest path.
+// GAP-3 PIN: a sole 1-instance ON-node writer plus an OFF-node binder that provably only
+// reads must stay LOCAL_NONATOMIC -- the plain word is already NoC-readable, so the remote
+// observer costs the writer nothing. (With a non-provable observer -- e.g. the census probe,
+// whose source contains up() -- the same shape stays EXTERNAL: see run_scope's EXTERNAL tests.)
+TEST_F(SemScopeFixture, TestCensusSoleWriterWithReadOnlyRemoteObserverPicksLocal) {
+    if (!has_second_node()) {
+        GTEST_SKIP() << "needs >= 2 worker nodes for the off-node observer";
+    }
+    const experimental::KernelSpecName WRITER{"sem_gap3_writer"};
+    const experimental::KernelSpecName OBSERVER{"sem_gap3_observer"};
+    experimental::SemaphoreSpec sem{.unique_id = experimental::SemaphoreSpecName{"counter_sem"}, .target_nodes = core};
+    experimental::KernelSpec writer_spec{
+        .unique_id = WRITER,
+        .source = kernel_path_local_writer,  // provably LOCAL_WRITER (the census probe is not:
+                                             // its ring-residency report takes a raw address)
+        .num_threads = 1,
+        .semaphore_bindings =
+            {{.semaphore_spec_name = experimental::SemaphoreSpecName{"counter_sem"}, .accessor_name = "counter"}},
+        .runtime_arg_schema = {.runtime_arg_names = {"report_addr", "increment_times"}},
+        .hw_config = experimental::DataMovementGen2Config{},
+    };
+    experimental::KernelSpec observer_spec{
+        .unique_id = OBSERVER,
+        .source = kernel_path_readonly_observer,
+        .num_threads = 1,
+        .semaphore_bindings =
+            {{.semaphore_spec_name = experimental::SemaphoreSpecName{"counter_sem"}, .accessor_name = "counter"}},
+        .hw_config = experimental::DataMovementGen2Config{},
+    };
+    experimental::WorkUnitSpec wu_w{.name = "wu_w", .kernels = {WRITER}, .target_nodes = core};
+    experimental::WorkUnitSpec wu_o{.name = "wu_o", .kernels = {OBSERVER}, .target_nodes = second_node()};
+    experimental::ProgramSpec spec{
+        .name = "sem_gap3_pin",
+        .kernels = {writer_spec, observer_spec},
+        .semaphores = {sem},
+        .work_units = {wu_w, wu_o}};
+
+    std::vector<uint32_t> sentinel(2, kNoReport);
+    tt::tt_metal::detail::WriteToDeviceL1(device_, core, report_addr, sentinel);
+    Program program = experimental::MakeProgramFromSpec(*mesh_device_, spec);
+    experimental::ProgramRunArgs params;
+    params.kernel_run_args = {
+        experimental::ProgramRunArgs::KernelRunArgs{
+            .kernel = WRITER,
+            .runtime_arg_values = experimental::MakeRuntimeArgsForSingleNode(
+                core, {{"report_addr", report_addr}, {"increment_times", iterations}}),
+        },
+    };
+    experimental::SetProgramRunArgs(program, params);
+    distributed::MeshWorkload workload;
+    distributed::MeshCoordinate zero_coord{0, 0};
+    workload.add_program(distributed::MeshCoordinateRange{zero_coord, zero_coord}, std::move(program));
+    RunProgram(mesh_device_, workload);
+
+    tt::tt_metal::detail::ReadFromDeviceL1(device_, core, report_addr, 2 * sizeof(uint32_t), result);
+    ASSERT_EQ(result.size(), 2u);
+    ASSERT_NE(result[0], kNoReport) << "writer probe never reported";
+    log_info(LogTest, "gap-3 pin: scope={} count={}", result[0], result[1]);
+    EXPECT_EQ(result[0], scope_val(SemScope::LOCAL_NONATOMIC))
+        << "a provably read-only remote observer must not force the sole writer off the plain word";
+    EXPECT_EQ(result[1], iterations);
+}
+
 TEST_F(SemScopeFixture, TestCensusSingleWriterPicksLocal) {
     const auto [scope, count] = run_census(core, {{.num_threads = 1, .increments = iterations, .reporter = true}});
     log_info(LogTest, "census single-writer: scope={} count={}", scope, count);

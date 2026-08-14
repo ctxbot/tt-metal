@@ -34,6 +34,10 @@
 #include "tt_metal/hw/inc/internal/tt-2xx/dataflow_buffer/dataflow_buffer_config.h"
 #include <core_descriptor.hpp>
 #include <llrt/tt_cluster.hpp>
+#include <cctype>
+#include <fstream>
+#include <iterator>
+#include <optional>
 #include <variant>
 
 namespace tt::tt_metal::experimental {
@@ -247,6 +251,354 @@ bool cached_geometry_ok(const SemaphoreSpec& sem, const CollectedSpecData::Semap
 // kernel_config ring), so the classifier falls through to EXTERNAL there instead.
 bool cached_tier_available() {
     return MetalContext::instance().rtoptions().get_target_device() != tt::TargetDevice::Emule;
+}
+
+// ============================================================================
+// Conservative semaphore-access scan (refines would-be-EXTERNAL semaphores only)
+// ============================================================================
+//
+// The census alone must treat every binder as a potential writer. This scan recovers the one
+// missing bit for two shapes -- "this binding provably never writes" and "this binding's ONLY
+// op is the remote up()" -- by reading the kernel source. It is deliberately conservative:
+// anything it cannot prove (aliasing, escapes, helper includes outside api/experimental,
+// unreadable source) classifies as WRITER, which keeps today's EXTERNAL pick. Misclassification
+// can therefore only cost performance, never correctness. Hygiene backstop: the Metal 2.0
+// source lint (a TEST-SUITE guard, not a build-time gate) bans raw semaphore access and
+// non-sem:: construction in kernels -- the scan is written NOT to rely on it.
+enum class SemAccessClass : uint8_t {
+    READ_ONLY,       // provably never writes (reads/waits only, or never touches the accessor)
+    LOCAL_WRITER,    // provably writes ONLY via the plain-local forms (single-arg up/down/set)
+    REMOTE_UP_ONLY,  // provably the ONLY op is the remote up(noc, x, y, v) form
+    WRITER,          // anything unprovable or mixed: the conservative default
+};
+
+// Strip comments and string/char literal contents (mirror of the hygiene lint's stripper).
+std::string StripCommentsForSemScan(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    bool in_block = false, in_line = false, in_str = false, in_chr = false;
+    for (size_t i = 0; i < text.size(); i++) {
+        const char c = text[i];
+        if (in_line) {
+            if (c == '\n') {
+                in_line = false;
+                out += '\n';
+            }
+            continue;
+        }
+        if (in_block) {
+            if (c == '*' && i + 1 < text.size() && text[i + 1] == '/') {
+                in_block = false;
+                i++;
+            } else if (c == '\n') {
+                out += '\n';
+            }
+            continue;
+        }
+        if (in_str || in_chr) {
+            if (c == '\\') {
+                i++;
+            } else if (c == (in_str ? '"' : '\'')) {
+                in_str = in_chr = false;
+            } else if (c == '\n') {
+                in_str = in_chr = false;
+                out += '\n';
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
+            in_line = true;
+            continue;
+        }
+        if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+            in_block = true;
+            i++;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            continue;
+        }
+        if (c == '\'' && (out.empty() || !std::isalnum(static_cast<unsigned char>(out.back())))) {
+            in_chr = true;
+            continue;
+        }
+        out += c;
+    }
+    return out;
+}
+
+std::optional<std::string> ReadKernelSourceText(const KernelSpec& kernel_spec) {
+    return std::visit(
+        [](const auto& src) -> std::optional<std::string> {
+            using T = std::decay_t<decltype(src)>;
+            if constexpr (std::is_same_v<T, KernelSpec::SourceCode>) {
+                return src.code;
+            } else {
+                // Mirror the JIT's resolve_path order EXACTLY (impl/kernels/kernel.cpp): the scan
+                // must read the same file the compiler will, or a stale copy on a different
+                // search path could be scanned instead of the code that runs.
+                const auto& rtoptions = MetalContext::instance().rtoptions();
+                std::vector<std::filesystem::path> candidates;
+                if (src.is_absolute()) {
+                    candidates.push_back(src);
+                } else {
+                    candidates.push_back(std::filesystem::current_path() / src);
+                    if (rtoptions.is_kernel_dir_specified()) {
+                        candidates.push_back(std::filesystem::path(rtoptions.get_kernel_dir()) / src);
+                    }
+                    candidates.push_back(std::filesystem::path(rtoptions.get_system_kernel_dir()) / src);
+                    candidates.push_back(std::filesystem::path(rtoptions.get_root_dir()) / src);
+                }
+                for (const auto& p : candidates) {
+                    if (!std::filesystem::exists(p)) {
+                        continue;
+                    }
+                    std::ifstream f(p);
+                    if (!f) {
+                        return std::nullopt;
+                    }
+                    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                }
+                return std::nullopt;
+            }
+        },
+        kernel_spec.source);
+}
+
+bool IsIdentChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
+
+// Classify what `kernel` can do to the semaphore bound as `accessor`. See the banner above.
+SemAccessClass ScanSemaphoreAccess(const std::string& stripped, const std::string& accessor) {
+    // (Includes are allowlisted separately on the RAW text: KernelIncludesAreScannable.)
+    const std::string token = "sem::" + accessor;
+    // Collect variables constructed from this accessor; any other appearance of the token
+    // (aliasing, arithmetic, passing) is unprovable.
+    std::vector<std::string> vars;
+    size_t consumed = 0, total = 0;
+    for (size_t pos = stripped.find(token); pos != std::string::npos; pos = stripped.find(token, pos + 1)) {
+        if (pos > 0 && IsIdentChar(stripped[pos - 1])) {
+            continue;  // suffix of a longer name
+        }
+        const size_t after = pos + token.size();
+        if (after < stripped.size() && IsIdentChar(stripped[after])) {
+            continue;  // prefix of a longer name (different accessor)
+        }
+        total++;
+        // Allowed context 1: sem_scope_of(sem::acc)
+        size_t b = pos;
+        while (b > 0 && std::isspace(static_cast<unsigned char>(stripped[b - 1]))) {
+            b--;
+        }
+        if (b > 0 && stripped[b - 1] == '(') {
+            size_t e = b - 1;
+            while (e > 0 && std::isspace(static_cast<unsigned char>(stripped[e - 1]))) {
+                e--;
+            }
+            size_t id_end = e, id_beg = e;
+            while (id_beg > 0 && IsIdentChar(stripped[id_beg - 1])) {
+                id_beg--;
+            }
+            const std::string callee = stripped.substr(id_beg, id_end - id_beg);
+            if (callee == "sem_scope_of") {
+                consumed++;
+                continue;
+            }
+            // Allowed context 2: Semaphore [<...>] var (sem::acc)   (also {} form)
+            // callee is then the VARIABLE name; check what precedes it.
+            size_t t = id_beg;
+            while (t > 0 && std::isspace(static_cast<unsigned char>(stripped[t - 1]))) {
+                t--;
+            }
+            if (t > 0 && stripped[t - 1] == '>') {  // skip a template argument list
+                int depth = 1;
+                t--;
+                while (t > 0 && depth > 0) {
+                    t--;
+                    if (stripped[t] == '>') {
+                        depth++;
+                    } else if (stripped[t] == '<') {
+                        depth--;
+                    }
+                }
+                while (t > 0 && std::isspace(static_cast<unsigned char>(stripped[t - 1]))) {
+                    t--;
+                }
+            }
+            size_t ty_end = t, ty_beg = t;
+            while (ty_beg > 0 && IsIdentChar(stripped[ty_beg - 1])) {
+                ty_beg--;
+            }
+            if (stripped.substr(ty_beg, ty_end - ty_beg) == "Semaphore" && !callee.empty()) {
+                vars.push_back(callee);
+                consumed++;
+                continue;
+            }
+        }
+    }
+    if (consumed != total) {
+        return SemAccessClass::WRITER;  // aliased/escaped/odd usage: unprovable
+    }
+    // Catch spellings the sem:: token search cannot see (whitespace-qualified `sem :: name`,
+    // macro-pasted names): any bare word-bounded occurrence of the accessor identifier that is
+    // NOT a recognized construction variable makes the binding unprovable. When the variable
+    // shares the accessor's name (the universal pattern), the variable walk below covers every
+    // occurrence instead.
+    if (std::find(vars.begin(), vars.end(), accessor) == vars.end()) {
+        for (size_t pos = stripped.find(accessor); pos != std::string::npos; pos = stripped.find(accessor, pos + 1)) {
+            if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
+                (pos + accessor.size() < stripped.size() && IsIdentChar(stripped[pos + accessor.size()]))) {
+                continue;
+            }
+            if (pos >= 5 && stripped.compare(pos - 5, 5, "sem::") == 0) {
+                continue;  // part of a consumed sem::<name> token
+            }
+            return SemAccessClass::WRITER;
+        }
+    }
+    if (total == 0) {
+        return SemAccessClass::READ_ONLY;  // binds but never touches it: harmless
+    }
+    // Classify every use of every bound variable.
+    bool any_remote_up = false, any_read = false, any_local_write = false;
+    for (const auto& var : vars) {
+        for (size_t pos = stripped.find(var); pos != std::string::npos; pos = stripped.find(var, pos + 1)) {
+            if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
+                (pos + var.size() < stripped.size() && IsIdentChar(stripped[pos + var.size()]))) {
+                continue;  // substring of another identifier
+            }
+            if (pos >= 5 && stripped.compare(pos - 5, 5, "sem::") == 0) {
+                continue;  // the accessor token inside sem::<name> (validated separately above)
+            }
+            if (pos > 0 && stripped[pos - 1] == ':') {
+                return SemAccessClass::WRITER;  // any OTHER qualified use is unprovable
+            }
+            size_t p = pos + var.size();
+            while (p < stripped.size() && std::isspace(static_cast<unsigned char>(stripped[p]))) {
+                p++;
+            }
+            // The declaration itself: `var (sem::...` or `var {sem::...`
+            if (p < stripped.size() && (stripped[p] == '(' || stripped[p] == '{')) {
+                continue;
+            }
+            if (p >= stripped.size() || stripped[p] != '.') {
+                return SemAccessClass::WRITER;  // escape: &var, var passed, assigned, etc.
+            }
+            p++;
+            size_t m_beg = p;
+            while (p < stripped.size() && IsIdentChar(stripped[p])) {
+                p++;
+            }
+            const std::string method = stripped.substr(m_beg, p - m_beg);
+            while (p < stripped.size() && std::isspace(static_cast<unsigned char>(stripped[p]))) {
+                p++;
+            }
+            if (p >= stripped.size() || stripped[p] != '(') {
+                return SemAccessClass::WRITER;  // method pointer / odd use
+            }
+            if (method == "value" || method == "wait" || method == "wait_min") {
+                any_read = true;
+                continue;
+            }
+            if (method == "up") {
+                // Count top-level commas: the remote overload has >= 4 arguments.
+                int depth = 1, commas = 0;
+                size_t q = p + 1;
+                while (q < stripped.size() && depth > 0) {
+                    const char c = stripped[q];
+                    if (c == '(') {
+                        depth++;
+                    } else if (c == ')') {
+                        depth--;
+                    } else if (c == ',' && depth == 1) {
+                        commas++;
+                    }
+                    q++;
+                }
+                if (commas >= 3) {
+                    any_remote_up = true;
+                    continue;
+                }
+                any_local_write = true;  // plain-local up()
+                continue;
+            }
+            if (method == "down" || method == "set") {
+                any_local_write = true;  // plain-local single-arg mutators
+                continue;
+            }
+            return SemAccessClass::WRITER;  // relay/multicast/anything else: unprovable
+        }
+    }
+    if (any_remote_up) {
+        // Remote-up mixed with ANYTHING else (reads or local writes) is unprovable: the remote
+        // form is an asynchronous NoC atomic that must never share a word with plain RMWs.
+        return (!any_read && !any_local_write) ? SemAccessClass::REMOTE_UP_ONLY : SemAccessClass::WRITER;
+    }
+    if (any_local_write) {
+        return SemAccessClass::LOCAL_WRITER;
+    }
+    return SemAccessClass::READ_ONLY;
+}
+
+// Source-level scannability gate, checked on the RAW text (the stripper erases string
+// contents, so include targets and directives must be inspected before stripping). Anything
+// this cannot fully account for makes the whole kernel unscannable (=> every binding WRITER):
+//  - every '#' directive containing 'include' is parsed properly (any spacing, #include_next,
+//    macro-computed includes): quoted targets must live under api/ or experimental/; angle
+//    targets must be plain slash-free system headers (<cstdint>); anything else fails.
+//  - '#define' anywhere: a macro could rename a method or hide a call.
+//  - raw string literals (R") and backslash-newline splices: they defeat the simple lexer.
+// A '#include' inside a comment fails too -- pessimism is free, unsoundness is not.
+bool KernelIncludesAreScannable(const std::string& raw) {
+    if (raw.find("R\"") != std::string::npos || raw.find("\\\n") != std::string::npos ||
+        raw.find("\\\r") != std::string::npos) {
+        return false;
+    }
+    for (size_t pos = raw.find('#'); pos != std::string::npos; pos = raw.find('#', pos + 1)) {
+        size_t p = pos + 1;
+        while (p < raw.size() && (raw[p] == ' ' || raw[p] == '\t')) {
+            p++;
+        }
+        size_t d_beg = p;
+        while (p < raw.size() && (std::isalnum(static_cast<unsigned char>(raw[p])) || raw[p] == '_')) {
+            p++;
+        }
+        const std::string directive = raw.substr(d_beg, p - d_beg);
+        if (directive == "define") {
+            return false;
+        }
+        if (directive.rfind("include", 0) != 0) {
+            continue;  // if/ifdef/endif/pragma/...: harmless to the scan (both arms are scanned)
+        }
+        while (p < raw.size() && (raw[p] == ' ' || raw[p] == '\t')) {
+            p++;
+        }
+        if (p >= raw.size()) {
+            return false;
+        }
+        if (raw[p] == '"') {
+            const size_t end = raw.find('"', p + 1);
+            if (end == std::string::npos) {
+                return false;
+            }
+            const std::string inc = raw.substr(p + 1, end - p - 1);
+            if (inc.rfind("api/", 0) != 0 && inc.rfind("experimental/", 0) != 0) {
+                return false;  // a local helper could hide an access we cannot see
+            }
+        } else if (raw[p] == '<') {
+            const size_t end = raw.find('>', p + 1);
+            if (end == std::string::npos) {
+                return false;
+            }
+            const std::string inc = raw.substr(p + 1, end - p - 1);
+            if (inc.find('/') != std::string::npos || inc.find('\\') != std::string::npos) {
+                return false;  // angle form can reach repo headers via -I; allow plain <cstdint>-style only
+            }
+        } else {
+            return false;  // macro-computed include target: unknowable
+        }
+    }
+    return true;
 }
 
 // Resolve the device SemScope baked into every kernel that binds this semaphore: the cheapest
@@ -3166,6 +3518,84 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
         // (rules in ResolveSemaphoreScope).
         semaphore_name_to_scope[semaphore_name] =
             ResolveSemaphoreScope(semaphore_spec, SemaphoreBinders(collected, semaphore_name));
+    }
+
+    // Access-scan refinement of would-be-EXTERNAL semaphores ONLY (never touches LOCAL/CACHED
+    // picks). One shape escapes the NoC-atomic tax when the conservative source scan can PROVE
+    // the access pattern (anything unprovable stays EXTERNAL -- see ScanSemaphoreAccess):
+    //   sole writer (1 instance) ON the sem's node, every other binder provably read-only
+    //   -> everyone bakes LOCAL_NONATOMIC (the plain word is already NoC-readable, and remote
+    //      observation costs a NoC read under every mechanism).
+    // The OFF-node-sole-writer sibling (posted value-writes instead of atomics) is deliberately
+    // NOT implemented: its write primitive (noc_inline_dw_write) HANGS on the Quasar RTL from a
+    // DM kernel (watcher-verified: sender wedged at NWIW) -- it needs its own characterization
+    // keystone first. Gen2 + non-emule only (emule keeps the Gen1 arms).
+    if (is_gen2_arch() && cached_tier_available()) {
+        std::unordered_map<const KernelSpec*, std::optional<std::string>> stripped_cache;
+        auto stripped_source = [&](const KernelSpec* k) -> const std::optional<std::string>& {
+            auto it = stripped_cache.find(k);
+            if (it == stripped_cache.end()) {
+                std::optional<std::string> text;
+                // User -D defines could rename identifiers the scan keys on; don't try to see
+                // through them (both #if arms are scanned anyway, so defines that only SELECT
+                // code are the ones we lose -- an acceptable pessimism).
+                if (k->compiler_options.defines.empty()) {
+                    text = ReadKernelSourceText(*k);
+                }
+                if (text.has_value() && !KernelIncludesAreScannable(*text)) {
+                    text.reset();  // unscannable source: treat every binding as writer
+                }
+                if (text.has_value()) {
+                    *text = StripCommentsForSemScan(*text);
+                }
+                it = stripped_cache.emplace(k, std::move(text)).first;
+            }
+            return it->second;
+        };
+        for (const auto& semaphore_spec : spec.semaphores) {
+            const SemaphoreSpecName& semaphore_name = semaphore_spec.unique_id;
+            if (semaphore_name_to_scope.at(semaphore_name) != SemScope::EXTERNAL) {
+                continue;
+            }
+            const auto& binders = SemaphoreBinders(collected, semaphore_name);
+            const NodeRangeSet sem_nodes = to_node_range_set(semaphore_spec.target_nodes);
+            if (binders.binders.empty() || sem_nodes.num_cores() != 1) {
+                continue;
+            }
+            const CollectedSpecData::SemaphoreBinderInfo::BinderRecord* writer = nullptr;
+            SemAccessClass writer_class = SemAccessClass::WRITER;
+            bool refinable = true;
+            for (const auto& rec : binders.binders) {
+                const auto& text = stripped_source(rec.kernel);
+                const SemAccessClass cls =
+                    text.has_value() ? ScanSemaphoreAccess(*text, rec.binding->accessor_name) : SemAccessClass::WRITER;
+                if (cls == SemAccessClass::READ_ONLY) {
+                    continue;
+                }
+                if (writer != nullptr) {  // second writer: genuinely contended, stay EXTERNAL
+                    refinable = false;
+                    break;
+                }
+                writer = &rec;
+                writer_class = cls;
+            }
+            if (!refinable || writer == nullptr) {
+                continue;  // no provable sole writer (or none at all: reads are free anyway)
+            }
+            const NodeRangeSet& writer_nodes = collected.kernel_node_set.at(writer->kernel->unique_id);
+            const uint32_t writer_instances = writer_nodes.num_cores() * writer->kernel->num_threads;
+            if (writer_instances != 1) {
+                continue;  // multiple writer instances need real atomicity
+            }
+            const bool writer_on_node = sem_nodes.merge(writer_nodes).num_cores() == sem_nodes.num_cores();
+            if (writer_on_node && writer_class == SemAccessClass::LOCAL_WRITER) {
+                // The sole on-node writer provably uses ONLY the plain-local forms, so its word
+                // is already correct and NoC-readable. A WRITER-class sole writer must NOT be
+                // demoted: it could mix a (self-targeted) remote up() -- an asynchronous NoC
+                // atomic -- with plain RMWs on the same word, which only EXTERNAL serializes.
+                semaphore_name_to_scope[semaphore_name] = SemScope::LOCAL_NONATOMIC;
+            }
+        }
     }
 
     // Semaphore ids are unique per CORE, not per program, so two semaphores on disjoint nodes can
