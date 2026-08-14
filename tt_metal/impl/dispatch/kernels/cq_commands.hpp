@@ -418,6 +418,7 @@ struct CQDispatchNotifySubordinateGoSignalCmd {
 struct CQDispatchRtProfilerFlushCmd {
     uint32_t wait_count;   // worker completion count to wait on
     uint32_t wait_stream;  // stream index to wait on
+    uint32_t watermark_id;
 } __attribute__((packed));
 
 struct CQDispatchSetNumWorkerSemsCmd {

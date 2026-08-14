@@ -2,7 +2,7 @@
 
 **Branch:** `pjosipovic/sparse-mla-topk-kv-gather-overlap`
 **Scope:** Blackhole profiler runtime only
-**Status:** Milestone 0 complete; Milestone 1 implementation under review
+**Status:** Milestones 0, 1, and 2 complete; Milestone 3 qualification pending
 
 ## 1. Goal
 

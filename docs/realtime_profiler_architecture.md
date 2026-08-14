@@ -53,13 +53,13 @@ This document describes how the **dispatch core** (dispatch_s), **real-time prof
 |   | Kernel: cq_dispatch_subordinate.cpp                                 |   |
 |   |                                                                     |   |
 |   |   L1 carve-out realtime_profiler_msg_t:                              |   |
-|   |     per-stream start rings, completed-record ring, mailbox B,       |   |
-|   |     drop counters, reset generations, termination handshake         |   |
+|   |     per-stream start/watermark slots, completed-record ring,        |   |
+|   |     mailbox B, drop counters, reset generations, termination        |   |
 |   |                                                                     |   |
 |   |   NCRISC: publish start descriptor before go signal; service at     |   |
 |   |     most one completed record into mailbox B per progress point     |   |
 |   |   TRISC0: observe each stream completion counter, capture device    |   |
-|   |     end tick, and publish a completed interval without waiting      |   |
+|   |     end tick, publish intervals, and order Finish watermarks        |   |
 |   +---------------------------------------------------------------------+   |
 +-----------------------------------------------------------------------------+
 ```

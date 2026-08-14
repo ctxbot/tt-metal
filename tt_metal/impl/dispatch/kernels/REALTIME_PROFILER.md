@@ -14,8 +14,9 @@ part of this feature; profiler eligibility rejects those architectures.
 | --- | --- | --- | --- |
 | Per-stream start queue | dispatch_s NCRISC | dispatch_s TRISC0 | Count `start_descriptor_drop_count`; launch continues |
 | Completed interval queue | dispatch_s TRISC0 | dispatch_s NCRISC | Count `completed_record_drop_count`; observation continues |
+| Per-stream watermark slot | dispatch_s NCRISC | dispatch_s TRISC0 / dispatch_s NCRISC | Count `watermark_request_drop_count`; dispatch continues |
 | Mailbox B | dispatch_s NCRISC | profiler-core BRISC | Leave record queued until a later bounded service point |
-| Reserved-core L1 ring | profiler-core BRISC | profiler-core NCRISC | Count `transport_drop_count`; acknowledge mailbox |
+| Reserved-core L1 ring | profiler-core BRISC | profiler-core NCRISC | Intervals reserve one control slot and count `transport_drop_count`; watermarks retain mailbox ownership until the control slot is available |
 | D2H socket | profiler-core NCRISC | host receiver | May backpressure the reserved profiler core, never dispatch |
 
 ## Component map
@@ -46,7 +47,7 @@ accurate sampled end tick; the ambiguous older intervals are counted as
 completion-observer drops.
 
 dispatch_s calls `service_realtime_profiler_once()` at existing progress
-points. One call forwards at most one completed interval and returns immediately
+points. One call forwards at most one completed interval or watermark and returns immediately
 when mailbox B is occupied. There is no steady-state profiler drain or
 acknowledgement loop on dispatch_s.
 
@@ -57,11 +58,13 @@ progress point services any queued record. Device-print builds retain their
 existing wait-before-`init_state` ordering. Neither progress path can overwrite
 live go-signal NOC state.
 
-The profiler-core BRISC NOC-reads the mailbox-B payload. If its local ring is
-full, it counts a transport drop and acknowledges the mailbox instead of
-waiting. The NCRISC remains responsible for coalesced D2H socket writes and may
-wait for host FIFO space without propagating that wait back to application
-dispatch.
+The profiler-core BRISC NOC-reads the mailbox-B payload. Intervals treat the
+ring as full with one slot remaining, count a transport drop, and acknowledge
+the mailbox. That reserved slot carries an ordered watermark. If it is
+temporarily occupied, BRISC retains the watermark notification until NCRISC
+makes space; dispatch_s does not wait for the acknowledgement. The NCRISC
+remains responsible for coalesced D2H socket writes and may wait for host FIFO
+space without propagating that wait back to application dispatch.
 
 The NCRISC snapshots the reserved-core ring indices and sends every available
 entry in a coalesced `push_entries_to_host()` call. Transfers are split only at
@@ -100,13 +103,42 @@ instead of correlating them with the reset counter.
 Queue producer and consumer indices use unsigned 32-bit distance, with bounded
 capacities far below the half range.
 
-## Finish service point
+## Finish watermark
 
-`CQ_DISPATCH_CMD_RT_PROFILER_FLUSH` is retained in Milestone 1 as a deterministic
-post-worker-completion dispatch_s service point for each sub-device. Its handler
-waits for the existing worker target and performs one bounded record service;
-it does not drain to a host-visible watermark. Milestone 2 may replace it when
-the collection API introduces an explicit record watermark.
+Every explicit exact collection allocates one nonzero 32-bit watermark ID and
+emits a `CQ_DISPATCH_CMD_RT_PROFILER_FLUSH` carrying that ID for each selected
+stream.
+After the existing worker wait, dispatch_s publishes a per-stream request.
+TRISC0 completes it only after the target is reached and every preceding start
+descriptor was emitted or counted as loss. Descriptors for later completion
+targets do not delay the watermark. TRISC0 snapshots the completed-record
+producer index, successful sequence, reset generation, and cumulative
+descriptor-, observer-, and record-stage loss. dispatch_s forwards that
+watermark only after its completed-record consumer reaches the snapshot, and
+prioritizes a now-eligible watermark over records accepted after the snapshot.
+
+A request from a reset generation newer than TRISC0's adopted generation waits
+for the next observer pass. A request from an older, already-quiesced generation
+uses a dedicated protocol-error watermark marker. Watermark request/protocol
+counters remain control-plane diagnostics; they are not folded into the
+descriptor-stage interval-loss delta.
+
+The host consumes watermark pages internally. A batch is complete only after
+the exact ID was observed for every registered stream on every active device;
+FIFO or ring emptiness is never completion evidence. Normal Finish sends the
+existing flush with watermark ID zero, so it neither creates collection state
+nor executes the device watermark path.
+`FinishAndCollectProgramRealtimeProfiler()` explicitly waits with a host
+control-plane timeout and returns stream masks plus source/transport loss
+deltas. Source loss is also reported as descriptor, completion-observer, and
+completed-record deltas. The command-queue identity field is fixed at zero for
+this single-command-queue protocol. It does not create host-derived operation
+durations.
+
+Watermarks already armed for a stream remain serviceable if a later sub-device
+manager temporarily reduces the active stream count: the stage scanner covers
+the fixed eight-stream protocol domain and uses the pending mask to avoid work
+on idle streams.
 
 ## Termination
 
@@ -117,13 +149,17 @@ post-quiescence loop may poll an occupied mailbox B for its IDLE acknowledgement
 until the device-cycle deadline so the last accepted record can advance. Any
 completed records or descriptors still queued after a successful observer stop
 are counted before dispatch termination proceeds. Observer-stop timeout is
-reported separately.
+reported separately. If profiler-core termination finds the final mailbox
+occupied while its ring is completely full, it counts that transport loss
+before acknowledging the mailbox and exiting.
+After the completion observer stops, any request or ready watermark still in a
+per-stream slot is counted as watermark-request loss before dispatch exits.
 
 ## Resource bounds
 
 - Per-stream start depth: 4 descriptors across at most 8 streams.
 - Completed interval depth: 128 records.
-- Dispatch-core profiler message: 5,080 bytes.
+- Dispatch-core profiler message: 5,536 bytes.
 - Reserved profiler-core L1 layout: unchanged at 262,336 bytes.
 
 The protocol, ordering proof, rejected alternatives, and milestone gates are

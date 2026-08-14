@@ -27,6 +27,61 @@
 constexpr uint32_t first_stream_index = FIRST_STREAM_INDEX;
 constexpr uint32_t num_streams_to_monitor = NUM_STREAMS_TO_MONITOR;
 
+FORCE_INLINE uint32_t
+realtime_profiler_descriptor_drop_total(volatile tt_l1_ptr realtime_profiler_msg_t* rt_profiler_msg) {
+    return rt_profiler_msg->start_descriptor_drop_count + rt_profiler_msg->unsupported_launch_drop_count +
+           rt_profiler_msg->reset_descriptor_drop_count + rt_profiler_msg->stuck_descriptor_head_count +
+           rt_profiler_msg->terminal_descriptor_drop_count;
+}
+
+FORCE_INLINE void try_complete_realtime_profiler_watermark(
+    volatile tt_l1_ptr realtime_profiler_msg_t* rt_profiler_msg,
+    uint32_t stream_index,
+    uint32_t current_count,
+    uint32_t adopted_generation) {
+    const uint32_t request_read_index = rt_profiler_msg->watermark_request_read_index[stream_index];
+    const uint32_t request_write_index = rt_profiler_msg->watermark_request_write_index[stream_index];
+    if (request_read_index == request_write_index || rt_profiler_msg->watermark_ready_read_index[stream_index] !=
+                                                         rt_profiler_msg->watermark_ready_write_index[stream_index]) {
+        return;
+    }
+
+    invalidate_l1_cache();
+    const uint32_t request_generation = rt_profiler_msg->watermark_request_generation[stream_index];
+    if (realtime_profiler_generation_after(request_generation, adopted_generation)) {
+        // dispatch_d published a newer reset epoch after this TRISC0 pass
+        // sampled the stream generation. Wait for the next pass to adopt it;
+        // the target is not comparable in the older epoch.
+        return;
+    }
+    const bool generation_changed = request_generation != adopted_generation;
+    if (!generation_changed && !realtime_profiler_stream_count_ge<MEM_WORD_ADDR_WIDTH>(
+                                   current_count, rt_profiler_msg->watermark_request_target[stream_index])) {
+        return;
+    }
+    if (generation_changed) {
+        // The request belongs to an older epoch already adopted by TRISC0. The
+        // dispatch reset protocol guarantees that epoch was quiesced, but the
+        // old target is no longer observable, so complete with a protocol error.
+        rt_profiler_msg->watermark_protocol_error_count++;
+    }
+
+    rt_profiler_msg->watermark_ready_id[stream_index] = rt_profiler_msg->watermark_request_id[stream_index];
+    rt_profiler_msg->watermark_ready_sequence[stream_index] = rt_profiler_msg->successful_record_sequence;
+    rt_profiler_msg->watermark_ready_descriptor_drop_count[stream_index] =
+        realtime_profiler_descriptor_drop_total(rt_profiler_msg);
+    rt_profiler_msg->watermark_ready_observer_drop_count[stream_index] =
+        rt_profiler_msg->completion_observer_drop_count + rt_profiler_msg->completion_observer_timeout_count;
+    rt_profiler_msg->watermark_ready_record_drop_count[stream_index] =
+        rt_profiler_msg->completed_record_drop_count + rt_profiler_msg->terminal_record_drop_count;
+    rt_profiler_msg->watermark_ready_record_write_index[stream_index] = rt_profiler_msg->record_write_index;
+    rt_profiler_msg->watermark_ready_protocol_error[stream_index] = generation_changed;
+    asm volatile("fence w, w" ::: "memory");
+    rt_profiler_msg->watermark_ready_write_index[stream_index]++;
+    asm volatile("fence w, w" ::: "memory");
+    rt_profiler_msg->watermark_request_read_index[stream_index] = request_read_index + 1;
+}
+
 FORCE_INLINE void dispatch_subordinate_realtime_profiler() {
     // Dispatch-core-local L1 region carved by DispatchMemMap (CommandQueueDeviceAddrType::
     // REALTIME_PROFILER_MSG). Address is supplied by host via the REALTIME_PROFILER_MSG_ADDR
@@ -141,6 +196,7 @@ FORCE_INLINE void dispatch_subordinate_realtime_profiler() {
                 if (scan_index != read_index) {
                     rt_profiler_msg->start_descriptor_read_index[i] = scan_index;
                 }
+                try_complete_realtime_profiler_watermark(rt_profiler_msg, i, current_count, adopted_generation[i]);
                 continue;
             }
 
@@ -184,6 +240,7 @@ FORCE_INLINE void dispatch_subordinate_realtime_profiler() {
                 rt_profiler_msg->record_write_index = record_write_index + 1;
             }
             rt_profiler_msg->start_descriptor_read_index[i] = scan_index;
+            try_complete_realtime_profiler_watermark(rt_profiler_msg, i, current_count, adopted_generation[i]);
         }
     }
     asm volatile("fence w, w" ::: "memory");

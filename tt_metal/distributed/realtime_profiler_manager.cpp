@@ -5,6 +5,7 @@
 #include "distributed/realtime_profiler_manager.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -330,6 +331,111 @@ RealtimeProfilerManager::DeviceState::DeviceState(DeviceState&&) noexcept = defa
 
 uint32_t RealtimeProfilerManager::host_fifo_capacity_pages() const { return RealtimeProfilerRuntimeSizes::fifo_pages; }
 
+uint32_t RealtimeProfilerManager::register_collection(uint32_t expected_stream_mask) {
+    TT_FATAL(expected_stream_mask != 0, "A real-time profiler collection must select at least one stream");
+    std::lock_guard<std::mutex> lock(collection_mutex_);
+    TT_FATAL(
+        collections_.size() < kMaxOutstandingCollections,
+        "Real-time profiler has {} exact collections awaiting callers",
+        collections_.size());
+    uint32_t watermark_id = 0;
+    do {
+        watermark_id = next_watermark_id_++;
+    } while (watermark_id == 0 || collections_.contains(watermark_id));
+
+    CollectionState state;
+    state.devices.reserve(devices_.size());
+    for (const auto& dev_state : devices_) {
+        state.devices.push_back(CollectionDeviceState{
+            .chip_id = dev_state.chip_id,
+            .expected_stream_mask = expected_stream_mask,
+            .baseline_record_count = dev_state.received_record_count,
+            .baseline_descriptor_drop = dev_state.latest_descriptor_drop_snapshot,
+            .baseline_observer_drop = dev_state.latest_observer_drop_snapshot,
+            .baseline_record_drop = dev_state.latest_record_drop_snapshot,
+            .baseline_transport_drop = dev_state.latest_transport_drop_snapshot,
+            .descriptor_drop_snapshot = dev_state.latest_descriptor_drop_snapshot,
+            .observer_drop_snapshot = dev_state.latest_observer_drop_snapshot,
+            .record_drop_snapshot = dev_state.latest_record_drop_snapshot,
+            .transport_drop_snapshot = dev_state.latest_transport_drop_snapshot,
+            .observed_record_count = dev_state.received_record_count,
+        });
+    }
+    collections_.emplace(watermark_id, std::move(state));
+    return watermark_id;
+}
+
+void RealtimeProfilerManager::cancel_collection(uint32_t watermark_id) {
+    std::lock_guard<std::mutex> lock(collection_mutex_);
+    collections_.erase(watermark_id);
+    collection_cv_.notify_all();
+}
+
+experimental::ProgramRealtimeProfilerCollectionResult RealtimeProfilerManager::make_collection_result_locked(
+    uint32_t watermark_id, const CollectionState& state, bool timed_out) const {
+    experimental::ProgramRealtimeProfilerCollectionResult result;
+    result.requested_watermark = watermark_id;
+    result.observed_watermark = state.complete ? watermark_id : 0;
+    result.timed_out = timed_out;
+    result.protocol_error = state.protocol_error;
+    result.devices.reserve(state.devices.size());
+    for (const auto& collection_device : state.devices) {
+        const auto device_it = std::ranges::find_if(
+            devices_, [&](const DeviceState& device) { return device.chip_id == collection_device.chip_id; });
+        const bool device_complete = collection_device.observed_stream_mask == collection_device.expected_stream_mask;
+        const uint64_t received = device_complete
+                                      ? collection_device.observed_record_count
+                                      : (device_it == devices_.end() ? collection_device.baseline_record_count
+                                                                     : device_it->received_record_count);
+        experimental::ProgramRealtimeProfilerDeviceCollection device_result{
+            .chip_id = collection_device.chip_id,
+            .expected_stream_mask = collection_device.expected_stream_mask,
+            .observed_stream_mask = collection_device.observed_stream_mask,
+            .record_count = received - collection_device.baseline_record_count,
+            .descriptor_dropped = static_cast<uint32_t>(
+                collection_device.descriptor_drop_snapshot - collection_device.baseline_descriptor_drop),
+            .observer_dropped = static_cast<uint32_t>(
+                collection_device.observer_drop_snapshot - collection_device.baseline_observer_drop),
+            .record_dropped =
+                static_cast<uint32_t>(collection_device.record_drop_snapshot - collection_device.baseline_record_drop),
+            .transport_dropped = static_cast<uint32_t>(
+                collection_device.transport_drop_snapshot - collection_device.baseline_transport_drop),
+        };
+        device_result.source_dropped =
+            device_result.descriptor_dropped + device_result.observer_dropped + device_result.record_dropped;
+        result.record_count += device_result.record_count;
+        result.descriptor_dropped += device_result.descriptor_dropped;
+        result.observer_dropped += device_result.observer_dropped;
+        result.record_dropped += device_result.record_dropped;
+        result.source_dropped += device_result.source_dropped;
+        result.transport_dropped += device_result.transport_dropped;
+        result.devices.push_back(device_result);
+    }
+    return result;
+}
+
+experimental::ProgramRealtimeProfilerCollectionResult RealtimeProfilerManager::wait_for_collection(
+    uint32_t watermark_id, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(collection_mutex_);
+    const bool ready = collection_cv_.wait_for(lock, timeout, [&] {
+        const auto it = collections_.find(watermark_id);
+        return it == collections_.end() || it->second.result.has_value();
+    });
+    auto it = collections_.find(watermark_id);
+    if (it == collections_.end()) {
+        experimental::ProgramRealtimeProfilerCollectionResult result;
+        result.requested_watermark = watermark_id;
+        result.protocol_error = true;
+        return result;
+    }
+    auto result = ready && it->second.result.has_value()
+                      ? *it->second.result
+                      : make_collection_result_locked(watermark_id, it->second, true);
+    collections_.erase(it);
+    lock.unlock();
+    return result;
+}
+
 uint32_t RealtimeProfilerManager::transport_drop_count() const {
     uint32_t peak = 0;
     for (const auto& dev_state : devices_) {
@@ -375,6 +481,8 @@ RealtimeProfilerDeviceLossCounts RealtimeProfilerManager::device_loss_counts() c
         counts.terminal_descriptor += read_field(Field::terminal_descriptor_drop_count);
         counts.terminal_record += read_field(Field::terminal_record_drop_count);
         counts.completion_observer_timeout += read_field(Field::completion_observer_timeout_count);
+        counts.watermark_request += read_field(Field::watermark_request_drop_count);
+        counts.watermark_protocol += read_field(Field::watermark_protocol_error_count);
     }
     return counts;
 }
@@ -583,36 +691,251 @@ void RealtimeProfilerManager::clear_completed_record_queue_for_testing() {
     }
 }
 
+void RealtimeProfilerManager::prime_reserved_ring_for_testing(uint32_t occupancy) {
+    TT_FATAL(
+        std::getenv("TT_RT_PROFILER_RING_TEST_HOOK") != nullptr,
+        "Reserved profiler ring injection requires TT_RT_PROFILER_RING_TEST_HOOK before device creation");
+    TT_FATAL(
+        occupancy >= RT_PROFILER_RING_CAPACITY - 1 && occupancy <= RT_PROFILER_RING_CAPACITY,
+        "Reserved profiler ring injection occupancy {} must be {} or {}",
+        occupancy,
+        RT_PROFILER_RING_CAPACITY - 1,
+        RT_PROFILER_RING_CAPACITY);
+    constexpr uint32_t stage_offset =
+        offsetof(RtProfilerRingBuffer, ncrisc_debug) + offsetof(RtProfilerNcriscDebug, stage);
+    constexpr uint32_t data_words = RT_PROFILER_RING_CAPACITY * RT_PROFILER_ENTRY_SIZE / sizeof(uint32_t);
+    std::vector<uint32_t> pause(1, RT_PROFILER_NCRISC_TEST_PAUSE_STAGE);
+    std::vector<uint32_t> zero_data(data_words, 0);
+    for (auto& dev_state : devices_) {
+        if (dev_state.core_l1.ring_buffer == 0 || !dev_state.device) {
+            continue;
+        }
+        tt::tt_metal::detail::WriteToDeviceL1(
+            dev_state.device,
+            dev_state.realtime_profiler_core,
+            dev_state.core_l1.ring_buffer + stage_offset,
+            pause,
+            CoreType::WORKER);
+        tt::tt_metal::detail::WriteToDeviceL1(
+            dev_state.device,
+            dev_state.realtime_profiler_core,
+            dev_state.core_l1.ring_buffer + offsetof(RtProfilerRingBuffer, data),
+            zero_data,
+            CoreType::WORKER);
+        std::vector<uint32_t> read_index(1, 0);
+        tt::tt_metal::detail::ReadFromDeviceL1(
+            dev_state.device,
+            dev_state.realtime_profiler_core,
+            dev_state.core_l1.ring_buffer + offsetof(RtProfilerRingBuffer, read_index),
+            sizeof(uint32_t),
+            read_index,
+            CoreType::WORKER);
+        std::vector<uint32_t> write_index(1, read_index[0] + occupancy);
+        tt::tt_metal::detail::WriteToDeviceL1(
+            dev_state.device,
+            dev_state.realtime_profiler_core,
+            dev_state.core_l1.ring_buffer + offsetof(RtProfilerRingBuffer, write_index),
+            write_index,
+            CoreType::WORKER);
+    }
+}
+
+void RealtimeProfilerManager::resume_reserved_ring_consumer_for_testing() {
+    constexpr uint32_t stage_offset =
+        offsetof(RtProfilerRingBuffer, ncrisc_debug) + offsetof(RtProfilerNcriscDebug, stage);
+    std::vector<uint32_t> resume(1, 0);
+    for (auto& dev_state : devices_) {
+        if (dev_state.core_l1.ring_buffer == 0 || !dev_state.device) {
+            continue;
+        }
+        tt::tt_metal::detail::WriteToDeviceL1(
+            dev_state.device,
+            dev_state.realtime_profiler_core,
+            dev_state.core_l1.ring_buffer + stage_offset,
+            resume,
+            CoreType::WORKER);
+    }
+}
+
+uint32_t RealtimeProfilerManager::reserved_ring_occupancy_for_testing() const {
+    uint32_t peak = 0;
+    for (const auto& dev_state : devices_) {
+        if (dev_state.core_l1.ring_buffer == 0 || !dev_state.device) {
+            continue;
+        }
+        std::vector<uint32_t> indices(2, 0);
+        tt::tt_metal::detail::ReadFromDeviceL1(
+            dev_state.device,
+            dev_state.realtime_profiler_core,
+            dev_state.core_l1.ring_buffer,
+            indices.size() * sizeof(uint32_t),
+            indices,
+            CoreType::WORKER);
+        peak = std::max(peak, indices[0] - indices[1]);
+    }
+    return peak;
+}
+
+bool RealtimeProfilerManager::dispatch_mailbox_pending_for_testing() const {
+    const auto& factory =
+        MetalContext::instance(context_id_).hal().get_realtime_profiler_msgs_factory(HalProgrammableCoreType::TENSIX);
+    using Message = realtime_profiler_msgs::realtime_profiler_msg_t;
+    for (const auto& dev_state : devices_) {
+        if (dev_state.dispatch_s_profiler_msg_addr == 0 || !dev_state.device) {
+            continue;
+        }
+        std::vector<uint32_t> state(1, 0);
+        tt::tt_metal::detail::ReadFromDeviceL1(
+            dev_state.device,
+            dev_state.dispatch_s_core,
+            dev_state.dispatch_s_profiler_msg_addr +
+                factory.offset_of<Message>(Message::Field::realtime_profiler_state),
+            sizeof(uint32_t),
+            state,
+            CoreType::WORKER);
+        if (state[0] == realtime_profiler_msgs::REALTIME_PROFILER_STATE_PUSH_B) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool RealtimeProfilerManager::inject_unexpected_watermark_for_testing(uint32_t watermark_id, uint32_t stream) {
+    TT_FATAL(stream < 32, "Injected real-time profiler stream {} is out of range", stream);
+    std::lock_guard<std::mutex> lock(collection_mutex_);
+    if (devices_.empty() || !collections_.contains(watermark_id)) {
+        return false;
+    }
+    std::array<uint32_t, realtime_profiler_msgs::REALTIME_PROFILER_RECORD_WORDS> page{};
+    page[0] = watermark_id;
+    page[2] = realtime_profiler_msgs::REALTIME_PROFILER_WATERMARK_MARKER_ID;
+    page[3] = (realtime_profiler_msgs::REALTIME_PROFILER_RECORD_SCHEMA_VERSION << 24) |
+              (realtime_profiler_msgs::REALTIME_PROFILER_RECORD_TYPE_WATERMARK << 16) | stream;
+    observe_watermark(devices_.front(), page.data());
+    return true;
+}
+
 void RealtimeProfilerManager::publish_pages(
-    const DeviceState& dev_state,
+    DeviceState& dev_state,
     const uint32_t* page_buf,
     uint32_t num_pages,
     std::vector<tt::ProgramRealtimeRecord>& records) {
     constexpr uint32_t kPageWords = RealtimeProfilerRuntimeSizes::page_size / sizeof(uint32_t);
-    auto is_record = [](const uint32_t* page) { return page[2] != 0 && page[3] != REALTIME_PROFILER_SYNC_MARKER_ID; };
+    auto record_type = [](const uint32_t* page) { return (page[3] >> 16) & 0xff; };
     records.clear();
     const uint32_t chip_id = dev_state.chip_id;
     const double sync_frequency = dev_state.sync_frequency;
     const DataCollector* const data_collector = data_collector_;
+    std::lock_guard<std::mutex> collection_lock(collection_mutex_);
     for (uint32_t page = 0; page < num_pages; ++page) {
         const uint32_t* rp = page_buf + page * kPageWords;
-        if (!is_record(rp)) {
+        if (rp[2] == 0 || rp[3] == REALTIME_PROFILER_SYNC_MARKER_ID ||
+            record_type(rp) != realtime_profiler_msgs::REALTIME_PROFILER_RECORD_TYPE_INTERVAL) {
             continue;
         }
+        const uint32_t header = rp[3];
         records.emplace_back(
             rp[2],
             chip_id,
             (static_cast<uint64_t>(rp[0]) << 32) | rp[1],
             (static_cast<uint64_t>(rp[4]) << 32) | rp[5],
             sync_frequency,
-            data_collector->GetKernelSourcesForRuntimeId(static_cast<uint16_t>(rp[2])));
+            data_collector->GetKernelSourcesForRuntimeId(static_cast<uint16_t>(rp[2])),
+            (header >> 8) & 0xff,
+            header & 0xff,
+            rp[6],
+            header >> 24,
+            record_type(rp));
     }
-    if (records.empty()) {
+    if (!records.empty()) {
+        num_published_records_.fetch_add(records.size(), std::memory_order_relaxed);
+        num_published_batches_.fetch_add(1, std::memory_order_relaxed);
+        ring_->writer().publish_batch(std::span<const tt::ProgramRealtimeRecord>(records));
+    }
+
+    // Publish callback records before making their following watermark visible
+    // to collection waiters. Then replay page order under the collection lock so
+    // each watermark captures the exact host-received record count at that point.
+    for (uint32_t page = 0; page < num_pages; ++page) {
+        const uint32_t* rp = page_buf + page * kPageWords;
+        if (rp[3] == REALTIME_PROFILER_SYNC_MARKER_ID) {
+            continue;
+        }
+        if (record_type(rp) == realtime_profiler_msgs::REALTIME_PROFILER_RECORD_TYPE_INTERVAL && rp[2] != 0) {
+            dev_state.received_record_count++;
+            dev_state.latest_record_sequence = rp[6];
+        } else if (
+            record_type(rp) == realtime_profiler_msgs::REALTIME_PROFILER_RECORD_TYPE_WATERMARK &&
+            (rp[2] == realtime_profiler_msgs::REALTIME_PROFILER_WATERMARK_MARKER_ID ||
+             rp[2] == realtime_profiler_msgs::REALTIME_PROFILER_WATERMARK_PROTOCOL_ERROR_MARKER_ID)) {
+            observe_watermark(dev_state, rp);
+        }
+    }
+}
+
+void RealtimeProfilerManager::observe_watermark(DeviceState& dev_state, const uint32_t* page) {
+    const uint32_t watermark_id = page[0];
+    const uint32_t stream = page[3] & 0xff;
+    auto it = collections_.find(watermark_id);
+    if (it == collections_.end()) {
         return;
     }
-    num_published_records_.fetch_add(records.size(), std::memory_order_relaxed);
-    num_published_batches_.fetch_add(1, std::memory_order_relaxed);
-    ring_->writer().publish_batch(std::span<const tt::ProgramRealtimeRecord>(records));
+    auto& state = it->second;
+    state.protocol_error |= page[2] == realtime_profiler_msgs::REALTIME_PROFILER_WATERMARK_PROTOCOL_ERROR_MARKER_ID;
+    auto device_it = std::ranges::find_if(
+        state.devices, [&](const CollectionDeviceState& device) { return device.chip_id == dev_state.chip_id; });
+    if (device_it == state.devices.end() || stream >= 32 || (device_it->expected_stream_mask & (1u << stream)) == 0 ||
+        (device_it->observed_stream_mask & (1u << stream)) != 0) {
+        state.protocol_error = true;
+    } else {
+        device_it->observed_stream_mask |= 1u << stream;
+        const uint32_t descriptor_snapshot = page[4];
+        const uint32_t observer_snapshot = page[5];
+        const uint32_t record_snapshot = page[6];
+        const uint32_t transport_snapshot = page[7];
+        if (static_cast<uint32_t>(descriptor_snapshot - device_it->baseline_descriptor_drop) >=
+            static_cast<uint32_t>(device_it->descriptor_drop_snapshot - device_it->baseline_descriptor_drop)) {
+            device_it->descriptor_drop_snapshot = descriptor_snapshot;
+        }
+        if (static_cast<uint32_t>(observer_snapshot - device_it->baseline_observer_drop) >=
+            static_cast<uint32_t>(device_it->observer_drop_snapshot - device_it->baseline_observer_drop)) {
+            device_it->observer_drop_snapshot = observer_snapshot;
+        }
+        if (static_cast<uint32_t>(record_snapshot - device_it->baseline_record_drop) >=
+            static_cast<uint32_t>(device_it->record_drop_snapshot - device_it->baseline_record_drop)) {
+            device_it->record_drop_snapshot = record_snapshot;
+        }
+        if (static_cast<uint32_t>(transport_snapshot - device_it->baseline_transport_drop) >=
+            static_cast<uint32_t>(device_it->transport_drop_snapshot - device_it->baseline_transport_drop)) {
+            device_it->transport_drop_snapshot = transport_snapshot;
+        }
+        dev_state.latest_descriptor_drop_snapshot = device_it->descriptor_drop_snapshot;
+        dev_state.latest_observer_drop_snapshot = device_it->observer_drop_snapshot;
+        dev_state.latest_record_drop_snapshot = device_it->record_drop_snapshot;
+        dev_state.latest_transport_drop_snapshot = device_it->transport_drop_snapshot;
+        const uint32_t source_delta = (device_it->descriptor_drop_snapshot - device_it->baseline_descriptor_drop) +
+                                      (device_it->observer_drop_snapshot - device_it->baseline_observer_drop) +
+                                      (device_it->record_drop_snapshot - device_it->baseline_record_drop);
+        const uint32_t transport_delta = device_it->transport_drop_snapshot - device_it->baseline_transport_drop;
+        if (dev_state.latest_record_sequence != page[1] && source_delta == 0 && transport_delta == 0) {
+            state.protocol_error = true;
+        }
+        if (device_it->observed_stream_mask == device_it->expected_stream_mask) {
+            device_it->observed_record_count = dev_state.received_record_count;
+        }
+    }
+    if (state.protocol_error) {
+        state.result = make_collection_result_locked(watermark_id, state, false);
+        collection_cv_.notify_all();
+        return;
+    }
+    state.complete = std::ranges::all_of(state.devices, [](const CollectionDeviceState& device) {
+        return device.observed_stream_mask == device.expected_stream_mask;
+    });
+    if (state.complete) {
+        state.result = make_collection_result_locked(watermark_id, state, false);
+        collection_cv_.notify_all();
+    }
 }
 
 bool RealtimeProfilerManager::has_active_finish_sync() const {
@@ -861,6 +1184,15 @@ void RealtimeProfilerManager::initialize_devices(const std::shared_ptr<MeshDevic
             dev_state.dispatch_s_core = dispatch_s_core;
             dev_state.dispatch_s_profiler_msg_addr = realtime_profiler_base_addr;
 
+            // dispatch_s/TRISC0 are waiting on the zero activation coordinate.
+            // Clear the complete local protocol block before publishing any
+            // remote address so newly added fields cannot inherit stale L1
+            // contents from an earlier dispatch layout.
+            const uint32_t profiler_msg_size = factory.size_of<realtime_profiler_msgs::realtime_profiler_msg_t>();
+            std::vector<uint32_t> zero_dispatch_msg(profiler_msg_size / sizeof(uint32_t), 0);
+            tt::tt_metal::detail::WriteToDeviceL1(
+                device, dispatch_s_core, realtime_profiler_base_addr, zero_dispatch_msg, CoreType::WORKER);
+
             uint32_t remote_state_addr_field_offset =
                 factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
                     realtime_profiler_msgs::realtime_profiler_msg_t::Field::realtime_profiler_remote_state_addr);
@@ -964,6 +1296,9 @@ void RealtimeProfilerManager::initialize_devices(const std::shared_ptr<MeshDevic
             ncrisc_config.defines["REALTIME_PROFILER_MSG_ADDR"] = std::to_string(realtime_profiler_base_addr);
             ncrisc_config.defines["REALTIME_PROFILER_PROTOCOL_BUILD_KEY"] =
                 std::to_string(realtime_profiler_msgs::REALTIME_PROFILER_PROTOCOL_VERSION);
+            if (std::getenv("TT_RT_PROFILER_RING_TEST_HOOK") != nullptr) {
+                ncrisc_config.defines["RT_PROFILER_RING_TEST_HOOK"] = "1";
+            }
             if (need_pcie_noc_defines) {
                 ncrisc_config.defines["RT_PROFILER_PCIE_NOC_X"] = std::to_string(pcie_noc_x);
                 ncrisc_config.defines["RT_PROFILER_PCIE_NOC_Y"] = std::to_string(pcie_noc_y);
@@ -1243,6 +1578,10 @@ uint64_t RealtimeProfilerManager::run_receiver_loop() {
     uint64_t num_pages_received = 0;
     auto last_fifo_plot = std::chrono::steady_clock::now();
     while (!stop_.load(std::memory_order_acquire)) {
+        if (receiver_loop_paused_for_testing_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(kReceiverMaxBackoff);
+            continue;
+        }
         const bool scan_sync_marker = finish_sync_busy_.load(std::memory_order_acquire);
         const uint32_t num_pages = drain_all_devices(scan_sync_marker, page_buf, record_buf);
         num_pages_received += num_pages;
@@ -1422,6 +1761,16 @@ RealtimeProfilerManager::~RealtimeProfilerManager() { shutdown(); }
 void RealtimeProfilerManager::shutdown() {
     constexpr auto kShutdownKernelExitGrace = std::chrono::milliseconds(100);
     MetalContext::instance(context_id_).data_collector()->DetachRealtimeProfilerCallbackListener(this);
+
+    {
+        std::lock_guard<std::mutex> lock(collection_mutex_);
+        for (auto& [watermark_id, state] : collections_) {
+            if (!state.result.has_value()) {
+                state.result = make_collection_result_locked(watermark_id, state, true);
+            }
+        }
+    }
+    collection_cv_.notify_all();
 
     const auto& factory =
         MetalContext::instance(context_id_).hal().get_realtime_profiler_msgs_factory(HalProgrammableCoreType::TENSIX);

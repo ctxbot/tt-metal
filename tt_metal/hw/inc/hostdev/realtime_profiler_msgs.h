@@ -28,13 +28,16 @@ constexpr uint32_t REALTIME_PROFILER_START_QUEUE_CAPACITY = 4;
 constexpr uint32_t REALTIME_PROFILER_START_DESCRIPTOR_WORDS = 5;
 constexpr uint32_t REALTIME_PROFILER_START_QUEUE_WORDS = 160;
 constexpr uint32_t REALTIME_PROFILER_RECORD_QUEUE_WORDS = 1024;
-constexpr uint32_t REALTIME_PROFILER_PROTOCOL_VERSION = 6;
+constexpr uint32_t REALTIME_PROFILER_PROTOCOL_VERSION = 7;
 #ifdef REALTIME_PROFILER_PROTOCOL_BUILD_KEY
 static_assert(REALTIME_PROFILER_PROTOCOL_BUILD_KEY == REALTIME_PROFILER_PROTOCOL_VERSION);
 #endif
 
 constexpr uint32_t REALTIME_PROFILER_RECORD_SCHEMA_VERSION = 1;
 constexpr uint32_t REALTIME_PROFILER_RECORD_TYPE_INTERVAL = 1;
+constexpr uint32_t REALTIME_PROFILER_RECORD_TYPE_WATERMARK = 2;
+constexpr uint32_t REALTIME_PROFILER_WATERMARK_MARKER_ID = 0xFFFFFFFE;
+constexpr uint32_t REALTIME_PROFILER_WATERMARK_PROTOCOL_ERROR_MARKER_ID = 0xFFFFFFFD;
 
 struct realtime_profiler_timestamp_t {
     uint32_t time_hi;
@@ -82,4 +85,24 @@ struct realtime_profiler_msg_t {
     volatile uint32_t terminal_descriptor_drop_count;
     volatile uint32_t terminal_record_drop_count;
     volatile uint32_t completion_observer_timeout_count;
+
+    // One nonblocking watermark request and one completed watermark slot per
+    // stream. Natural producer/consumer indices distinguish an empty slot from
+    // a pending request without reserving a batch ID value.
+    volatile uint32_t watermark_request_write_index[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_request_read_index[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_request_id[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_request_target[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_request_generation[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_write_index[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_read_index[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_id[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_sequence[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_descriptor_drop_count[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_observer_drop_count[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_record_drop_count[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_record_write_index[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_ready_protocol_error[REALTIME_PROFILER_MAX_STREAMS];
+    volatile uint32_t watermark_request_drop_count;
+    volatile uint32_t watermark_protocol_error_count;
 };

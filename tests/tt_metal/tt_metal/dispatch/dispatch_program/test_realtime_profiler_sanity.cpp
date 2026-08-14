@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
+#include <future>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -45,10 +46,12 @@
 #include "tt_metal/distributed/realtime_profiler_manager.hpp"
 #include "hostdev/realtime_profiler_msgs.h"
 #include "tt_metal/impl/dispatch/kernels/realtime_profiler_protocol.hpp"
+#include "tt_metal/impl/dispatch/kernels/realtime_profiler_ring_buffer.hpp"
 
 namespace tt::tt_metal {
 namespace {
 
+using tt::tt_metal::experimental::FinishAndCollectProgramRealtimeProfiler;
 using tt::tt_metal::experimental::IsProgramRealtimeProfilerActive;
 using tt::tt_metal::experimental::ProgramRealtimeProfilerCallbackHandle;
 using tt::tt_metal::experimental::ProgramRealtimeRecord;
@@ -82,6 +85,9 @@ TEST(RealtimeProfilerProtocol, CompletionCounterAndQueueIndicesWrapWithoutAmbigu
     EXPECT_TRUE(realtime_profiler_stream_count_ge<kCounterWidth>(1, 0));
     EXPECT_FALSE(realtime_profiler_stream_count_ge<kCounterWidth>(kCounterMax, 0));
     EXPECT_FALSE(realtime_profiler_stream_count_ge<kCounterWidth>(0, 1));
+    EXPECT_TRUE(realtime_profiler_generation_after(1, 0));
+    EXPECT_FALSE(realtime_profiler_generation_after(0, 1));
+    EXPECT_TRUE(realtime_profiler_generation_after(0, UINT32_MAX));
 
     constexpr uint32_t read_index = UINT32_MAX - 1;
     EXPECT_FALSE(realtime_profiler_queue_full(read_index + 3, read_index, 4));
@@ -96,6 +102,7 @@ TEST(RealtimeProfilerProtocol, CompletionCounterAndQueueIndicesWrapWithoutAmbigu
         MetalContext::instance().hal().get_realtime_profiler_msgs_factory(HalProgrammableCoreType::TENSIX);
     using GeneratedMessage = realtime_profiler_msgs::realtime_profiler_msg_t;
     EXPECT_EQ(factory.size_of<GeneratedMessage>(), sizeof(::realtime_profiler_msg_t));
+    EXPECT_EQ(sizeof(::realtime_profiler_msg_t), 5536u);
     EXPECT_EQ(
         factory.offset_of<GeneratedMessage>(GeneratedMessage::Field::kernel_start_b),
         offsetof(::realtime_profiler_msg_t, kernel_start_b));
@@ -110,6 +117,11 @@ TEST(RealtimeProfilerSanity, DisabledProfilerStillStopsDispatchObserver) {
         kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
     ASSERT_NE(mesh_device, nullptr);
     EXPECT_FALSE(IsProgramRealtimeProfilerActive());
+    const auto inactive =
+        FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::milliseconds(20));
+    EXPECT_TRUE(inactive.profiler_inactive);
+    EXPECT_FALSE(inactive.protocol_error);
+    EXPECT_TRUE(inactive.lossy());
     EXPECT_TRUE(mesh_device->close());
 }
 
@@ -402,6 +414,259 @@ TEST(RealtimeProfilerSanity, ConcurrentPartitionedSubDevicesUseIndependentComple
     EXPECT_TRUE(mesh_device->close());
 }
 
+TEST(RealtimeProfilerSanity, ExactWatermarkCollectsEverySelectedStream) {
+    constexpr int kDeviceId = 0;
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    const CoreCoord grid = mesh_device->compute_with_storage_grid_size();
+    if (grid.x < 3) {
+        mesh_device->close();
+        GTEST_SKIP() << "Watermark test requires three Tensix cores in one row";
+    }
+    const std::array cores{CoreCoord{0, 0}, CoreCoord{1, 0}, CoreCoord{2, 0}};
+    std::vector<SubDevice> sub_devices;
+    for (const auto& core : cores) {
+        sub_devices.emplace_back(std::array{CoreRangeSet(CoreRange(core, core))});
+    }
+    auto manager = mesh_device->create_sub_device_manager(sub_devices, 3200);
+    mesh_device->load_sub_device_manager(manager);
+
+    std::mutex records_mu;
+    std::vector<ProgramRealtimeRecord> records;
+    const auto handle = RegisterProgramRealtimeProfilerCallback([&](const ProgramRealtimeRecordBatch& batch) {
+        std::lock_guard<std::mutex> lock(records_mu);
+        records.insert(records.end(), batch.records.begin(), batch.records.end());
+    });
+
+    for (uint32_t stream = 0; stream < cores.size(); ++stream) {
+        mesh_device->set_sub_device_stall_group({{SubDeviceId{stream}}});
+        enqueue_concurrent_program(mesh_device, cores[stream], 0x7301 + stream, 20 + stream * 10);
+    }
+    mesh_device->reset_sub_device_stall_group();
+
+    const auto result =
+        FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    EXPECT_TRUE(result.complete());
+    EXPECT_FALSE(result.timed_out);
+    EXPECT_FALSE(result.protocol_error);
+    EXPECT_EQ(result.source_dropped, 0u);
+    EXPECT_EQ(result.transport_dropped, 0u);
+    ASSERT_EQ(result.devices.size(), 1u);
+    EXPECT_EQ(result.devices[0].expected_stream_mask, 0x7u);
+    EXPECT_EQ(result.devices[0].observed_stream_mask, 0x7u);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    UnregisterProgramRealtimeProfilerCallback(handle);
+    {
+        std::lock_guard<std::mutex> lock(records_mu);
+        std::set<uint32_t> observed_streams;
+        for (const auto& record : records) {
+            if (record.runtime_id >= 0x7301 && record.runtime_id <= 0x7303) {
+                EXPECT_EQ(record.schema_version, realtime_profiler_msgs::REALTIME_PROFILER_RECORD_SCHEMA_VERSION);
+                EXPECT_EQ(record.record_type, realtime_profiler_msgs::REALTIME_PROFILER_RECORD_TYPE_INTERVAL);
+                EXPECT_GT(record.sequence, 0u);
+                observed_streams.insert(record.dispatch_stream);
+            }
+        }
+        EXPECT_EQ(observed_streams, (std::set<uint32_t>{0, 1, 2}));
+    }
+
+    mesh_device->clear_loaded_sub_device_manager();
+    EXPECT_TRUE(mesh_device->close());
+}
+
+TEST(RealtimeProfilerSanity, CollectionTimeoutDoesNotUseRingEmptinessAndRecovers) {
+    constexpr int kDeviceId = 0;
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    auto* profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(profiler, nullptr);
+    profiler->set_receiver_loop_paused_for_testing(true);
+    const auto timed_out =
+        FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::milliseconds(20));
+    EXPECT_TRUE(timed_out.timed_out);
+    EXPECT_TRUE(timed_out.lossy());
+    EXPECT_FALSE(timed_out.complete());
+    ASSERT_FALSE(timed_out.devices.empty());
+    EXPECT_NE(timed_out.devices[0].expected_stream_mask, 0u);
+    EXPECT_EQ(timed_out.devices[0].observed_stream_mask, 0u);
+
+    profiler->set_receiver_loop_paused_for_testing(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto recovered =
+        FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    EXPECT_TRUE(recovered.complete());
+    EXPECT_FALSE(recovered.timed_out);
+    EXPECT_FALSE(recovered.protocol_error);
+    EXPECT_TRUE(mesh_device->close());
+}
+
+TEST(RealtimeProfilerSanity, WatermarkIdWrapSkipsReservedZero) {
+    constexpr int kDeviceId = 0;
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    auto* profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(profiler, nullptr);
+    profiler->set_next_watermark_id_for_testing(UINT32_MAX);
+    const auto before_wrap =
+        FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    const auto after_wrap =
+        FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    EXPECT_TRUE(before_wrap.complete());
+    EXPECT_EQ(before_wrap.requested_watermark, UINT32_MAX);
+    EXPECT_TRUE(after_wrap.complete());
+    EXPECT_EQ(after_wrap.requested_watermark, 1u);
+    EXPECT_TRUE(mesh_device->close());
+}
+
+TEST(RealtimeProfilerSanity, UnexpectedWatermarkReturnsPromptProtocolError) {
+    constexpr int kDeviceId = 0;
+    constexpr uint32_t kWatermarkId = 0x7501;
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    auto* profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(profiler, nullptr);
+    profiler->set_receiver_loop_paused_for_testing(true);
+    profiler->set_next_watermark_id_for_testing(kWatermarkId);
+    auto collection = std::async(std::launch::async, [&] {
+        return FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    });
+
+    bool injected = false;
+    for (uint32_t attempt = 0; attempt < 100 && !injected; ++attempt) {
+        injected = profiler->inject_unexpected_watermark_for_testing(kWatermarkId, /*stream=*/31);
+        if (!injected) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    EXPECT_TRUE(injected);
+    const auto prompt_status = collection.wait_for(std::chrono::milliseconds(100));
+    profiler->set_receiver_loop_paused_for_testing(false);
+    const auto result = collection.get();
+    EXPECT_EQ(prompt_status, std::future_status::ready);
+    EXPECT_TRUE(result.protocol_error);
+    EXPECT_FALSE(result.complete());
+    EXPECT_FALSE(result.timed_out);
+    EXPECT_TRUE(result.lossy());
+    EXPECT_TRUE(mesh_device->close());
+}
+
+TEST(RealtimeProfilerSanity, BackToBackExactWatermarksDoNotStrandReadySlot) {
+    constexpr int kDeviceId = 0;
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    constexpr uint32_t kIterations = 64;
+    for (uint32_t iteration = 0; iteration < kIterations; ++iteration) {
+        const auto result =
+            FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(1));
+        ASSERT_TRUE(result.complete()) << "watermark stranded at iteration " << iteration;
+        ASSERT_FALSE(result.timed_out) << "watermark timed out at iteration " << iteration;
+    }
+    EXPECT_TRUE(mesh_device->close());
+}
+
+TEST(RealtimeProfilerSanity, ReservedRingDropsIntervalsAndRetainsFullRingWatermark) {
+    constexpr int kDeviceId = 0;
+    ASSERT_EQ(::setenv("TT_RT_PROFILER_RING_TEST_HOOK", "1", /*overwrite=*/1), 0);
+    ScopedEnvUnset restore_env{"TT_RT_PROFILER_RING_TEST_HOOK"};
+    auto mesh_device = distributed::MeshDevice::create_unit_mesh(
+        kDeviceId, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1, DispatchCoreConfig{DispatchCoreType::WORKER});
+    ASSERT_NE(mesh_device, nullptr);
+    if (!IsProgramRealtimeProfilerActive()) {
+        mesh_device->close();
+        GTEST_SKIP() << "Real-time profiler is not active on this dispatch config";
+    }
+
+    const CoreCoord core{0, 0};
+    SubDevice sub_device(std::array{CoreRangeSet(CoreRange(core, core))});
+    auto manager = mesh_device->create_sub_device_manager({sub_device}, 3200);
+    mesh_device->load_sub_device_manager(manager);
+
+    // Warm compilation before the injection window, then hold NCRISC only at
+    // the pathological interval-full threshold. The production image does not
+    // compile this hook.
+    enqueue_concurrent_program(mesh_device, core, /*runtime_id=*/0, 20);
+    distributed::Finish(mesh_device->mesh_command_queue());
+    auto* profiler = mesh_device->impl().get_realtime_profiler();
+    ASSERT_NE(profiler, nullptr);
+    const uint32_t initial_transport_drops = profiler->transport_drop_count();
+    profiler->prime_reserved_ring_for_testing(RT_PROFILER_RING_CAPACITY - 1);
+    EXPECT_EQ(profiler->reserved_ring_occupancy_for_testing(), RT_PROFILER_RING_CAPACITY - 1);
+
+    // The reserved control slot must make interval pressure lossy instead of
+    // blocking dispatch.
+    enqueue_concurrent_program(mesh_device, core, /*runtime_id=*/0x7401, 20);
+    distributed::Finish(mesh_device->mesh_command_queue());
+    for (uint32_t attempt = 0; attempt < 100 && profiler->transport_drop_count() == initial_transport_drops;
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GT(profiler->transport_drop_count(), initial_transport_drops);
+
+    // The first watermark occupies the reserved slot. The second reaches the
+    // dispatch mailbox while the ring is completely full and must remain
+    // pending, without blocking dispatch_s, until NCRISC resumes.
+    auto first = std::async(std::launch::async, [&] {
+        return FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    });
+    for (uint32_t attempt = 0;
+         attempt < 100 && profiler->reserved_ring_occupancy_for_testing() != RT_PROFILER_RING_CAPACITY;
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(profiler->reserved_ring_occupancy_for_testing(), RT_PROFILER_RING_CAPACITY);
+
+    auto second = std::async(std::launch::async, [&] {
+        return FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    });
+    for (uint32_t attempt = 0; attempt < 100 && !profiler->dispatch_mailbox_pending_for_testing(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(profiler->dispatch_mailbox_pending_for_testing());
+    EXPECT_EQ(first.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+    EXPECT_EQ(second.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+
+    profiler->resume_reserved_ring_consumer_for_testing();
+    const auto first_result = first.get();
+    const auto second_result = second.get();
+    EXPECT_TRUE(first_result.complete());
+    EXPECT_TRUE(second_result.complete());
+    EXPECT_GT(first_result.transport_dropped, 0u);
+
+    mesh_device->clear_loaded_sub_device_manager();
+    EXPECT_TRUE(mesh_device->close());
+}
+
 TEST(RealtimeProfilerSanity, FullDeviceQueuesCountDropsWithoutStallingDispatch) {
     constexpr int kDeviceId = 0;
     constexpr uint32_t kRuntimeId = 0x7201;
@@ -491,6 +756,14 @@ TEST(RealtimeProfilerSanity, CompletionObserverAccountsMultiReadyAndResetDescrip
         reset_losses.reset_descriptor,
         multi_ready_losses.reset_descriptor + realtime_profiler_msgs::REALTIME_PROFILER_START_QUEUE_CAPACITY);
     rt_profiler->clear_start_descriptor_queue_for_testing(/*stream_index=*/0);
+
+    const auto collection =
+        FinishAndCollectProgramRealtimeProfiler(mesh_device->mesh_command_queue(), std::chrono::seconds(5));
+    EXPECT_TRUE(collection.complete());
+    EXPECT_GT(collection.source_dropped, 0u);
+    EXPECT_EQ(
+        collection.source_dropped,
+        collection.descriptor_dropped + collection.observer_dropped + collection.record_dropped);
 
     EXPECT_TRUE(mesh_device->close());
 }

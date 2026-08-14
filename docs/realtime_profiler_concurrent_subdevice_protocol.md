@@ -261,18 +261,16 @@ The BRISC must not wait for reserved-ring capacity while handling an interval
 from dispatch_s. The NCRISC and D2H socket can stall independently without
 stalling program dispatch; pressure becomes counted interval loss.
 
-## Planned Milestone 2 watermark protocol
-
-The following section is a reviewed design target, not part of the Milestone 1
-device-publication implementation.
+## Milestone 2 watermark protocol
 
 ### Device request
 
-One `finish_nolock()` call allocates a monotonically increasing 32-bit batch
-watermark ID and registers the participating sub-device stream mask with the
-profiler manager. Every `CQ_DISPATCH_CMD_RT_PROFILER_FLUSH` emitted by that
-Finish carries the same batch ID. A normal Finish enqueues these requests but
-does not wait for profiler delivery.
+One explicit exact collection allocates a monotonically increasing 32-bit batch
+watermark ID, skipping reserved value zero, and registers the participating
+sub-device stream mask with the profiler manager. Every
+`CQ_DISPATCH_CMD_RT_PROFILER_FLUSH` emitted by that Finish carries the same batch
+ID. A normal Finish carries watermark ID zero, which bypasses both collection
+registration and the device watermark path.
 
 After its existing worker wait completes, dispatch_s publishes a per-stream
 watermark request containing:
@@ -282,7 +280,8 @@ watermark request containing:
 - a request generation.
 
 This is a dedicated per-stream slot, not part of the start descriptor ring, so
-a full descriptor ring cannot lose the request.
+a full descriptor ring cannot lose the request. A second request reaching an
+occupied slot is counted as watermark-control loss and never stalls dispatch.
 
 ### Device completion
 
@@ -291,6 +290,16 @@ TRISC0 marks a per-stream watermark ready only after:
 - the stream counter reached the requested target; and
 - every start descriptor on that stream whose target is at or before the
   requested target has been emitted or counted as dropped.
+
+The descriptor scan consumes every satisfied descriptor before checking the
+watermark target. An unmet descriptor is necessarily for a later target and
+does not delay the watermark.
+
+Watermark generations are directional. If a request carries a generation newer
+than TRISC0 has adopted, TRISC0 waits for its next pass to adopt that reset epoch
+before comparing the target. If the request is older than the adopted epoch,
+the old counter target is no longer observable; TRISC0 completes it with the
+protocol-error marker because dispatch reset already quiesced the prior epoch.
 
 The ready state snapshots:
 
@@ -305,8 +314,16 @@ has reached the snapshotted producer index. Thus the watermark cannot overtake a
 successfully accepted interval on the dispatch core.
 
 The watermark uses the existing eight-word transport payload with a reserved
-record type. The reserved profiler BRISC adds its cumulative transport-drop
-snapshot before enqueueing the control page in the local ring.
+record type. Its payload is watermark ID, successful interval sequence,
+normal or protocol-error marker ID, schema/type/stream metadata, cumulative descriptor loss,
+cumulative observer loss, cumulative record loss, and cumulative transport
+loss. Interval publication leaves one reserved slot in the profiler-core ring,
+and the reserved profiler BRISC adds the transport-loss snapshot before
+enqueueing the control page. If even that control slot is temporarily occupied,
+BRISC retains the mailbox notification until NCRISC makes space; dispatch_s
+does not wait for that acknowledgement. If termination occurs while the ring is
+completely full, BRISC counts the occupied mailbox as transport loss before it
+acknowledges and exits.
 
 ### Host completion
 
@@ -320,7 +337,8 @@ The host collection result contains:
 - requested watermark;
 - observed participating-stream mask per active device;
 - records received since the caller's baseline snapshot;
-- source and transport drop deltas;
+- descriptor, completion-observer, completed-record, aggregate source, and
+  transport drop deltas;
 - host callback-ring drop information remains callback-specific and is not
   conflated with device loss;
 - timeout and protocol-error state.
@@ -329,6 +347,48 @@ A batch is complete only when every registered participating stream is observed
 for every active device. A later batch does not satisfy an earlier batch, because
 streams can become ready out of order. Ring emptiness is never used as proof of
 completion.
+
+`experimental::FinishAndCollectProgramRealtimeProfiler()` is the exact-batch
+API. It registers a retained batch while holding the command-queue API lock,
+executes the normal Finish path, releases that lock, and waits for that batch ID.
+The timeout is host control-plane policy only; interval duration fields remain
+raw device start/end ticks. Normal `Finish` creates no batch and never waits for
+host profiler progress.
+
+The interval parser now preserves schema version, record type, command-queue
+identity, dispatch stream, and successful-publication sequence in
+`ProgramRealtimeRecord`. Command-queue identity is fixed at zero because this
+protocol supports one command queue only. Collection results report expected
+and observed stream masks, received-record count, stage-specific source-drop
+deltas, their aggregate, transport-drop delta, timeout, and protocol-error
+state per device and in aggregate. Callback-ring drops remain separate in
+`ProgramRealtimeRecordBatch::dropped`.
+
+Loss baselines are the last watermark snapshot observed when a collection is
+registered. Concurrently outstanding collections can therefore report
+overlapping deltas; they are per-collection diagnostics, not a partition of a
+global loss counter. Serial exact collections partition deltas naturally.
+Watermark request/protocol counters remain control-plane device diagnostics and
+are not mislabeled as descriptor-stage interval loss. A generation crossing is
+carried by the dedicated protocol-error marker; a request that cannot be
+published causes an incomplete timeout.
+
+Collection registration is bounded and used only by the explicit exact API;
+normal Finish performs no allocation or host collection bookkeeping. Exact
+results are retained until their caller consumes or cancels them. An exception
+in the Finish path cancels its registered state before propagating the exception.
+Virtualized-unicast dispatch is outside this Blackhole route: attempting its
+watermark path increments the request-loss counter instead of silently
+claiming completion.
+
+If the profiler is ineligible or inactive, the exact API returns
+`profiler_inactive` rather than reporting a protocol violation. A malformed or
+unexpected watermark returns an incomplete `protocol_error` result immediately
+instead of consuming the caller's full timeout.
+
+The caller must keep the mesh and command queue alive until the exact API
+returns, matching the lifetime rule for other queue operations. Shutdown wakes
+registered collection waits before destroying the profiler manager.
 
 ## Lifecycle
 
@@ -582,8 +642,63 @@ period has not yet been characterized on silicon. Milestone 3 must measure it
 before making an absolute end-timestamp error claim; Milestone 1's concurrent
 test establishes ordering from device ticks, not sub-poll-cycle accuracy.
 
-Watermarks, collection results, timeout reporting, and host-visible deltas for
-the dispatch-core source-drop counters remain Milestone 2 work. Milestone 1 now
-has deterministic device injection for descriptor-ring fullness,
-completed-record-ring fullness, multi-ready coalescing, and reset-generation
-cleanup; each path reports stage-specific loss without blocking execution.
+## Milestone 2 implementation evidence
+
+Milestone 2 implements protocol version 7. Each explicit exact collection
+registers one batch ID and emits a request for every selected stream. TRISC0 snapshots the
+successful interval sequence, descriptor/observer/record source loss, reset
+generation, and completed-ring producer index. dispatch_s publishes the watermark only after its consumer
+reaches that index, and the profiler-core BRISC adds the cumulative transport
+loss snapshot. The host validates the watermark sequence against the last
+received interval sequence when no transport loss explains a gap.
+
+The public experimental collection result reports exact requested/observed
+watermarks, per-device expected/observed stream masks, record count,
+descriptor/observer/record/transport loss deltas, aggregate source loss,
+timeout, and protocol-error state. A timeout is lossy and incomplete; it never
+triggers an L1 readback, tensor transfer, or host-duration substitution.
+Callback-ring loss remains callback-local.
+
+The dispatch-core message grew by 456 B, from 5,080 B to 5,536 B, below the
+8 KiB gate. The reserved profiler-core layout remains 262,336 B. Matched current
+Blackhole images from the focused test are:
+
+| Component | Milestone 1 text | Milestone 2 text | Delta |
+| --- | ---: | ---: | ---: |
+| dispatch_s NCRISC | 5,952 B | 7,036 B | +1,084 B |
+| dispatch_s TRISC0 | 1,240 B | 1,664 B | +424 B |
+| profiler BRISC | 912 B | 1,100 B | +188 B |
+| profiler NCRISC | 1,592 B | 1,592 B | 0 B |
+
+The watermark scan is out of line and guarded by a local pending-stream mask.
+Before a Finish arms a request, ordinary dispatch_s profiler service adds one
+mask branch rather than an inlined per-stream scan.
+
+The full-ring test compiles an NCRISC-only saturation pause under
+`TT_RT_PROFILER_RING_TEST_HOOK`. The production image contains no pause check
+and remains 1,592 B text; the hook is consulted only at occupancy 4,095 or
+4,096 in the test variant.
+
+Validation on the local four-chip Blackhole P150b QuietBox, firmware 19.10.0:
+
+- Release `unit_tests_dispatch` build passed;
+- `RealtimeProfilerProtocol.*:RealtimeProfilerSanity.*`: 16/16 passed,
+  including exact three-stream collection, delayed receiver timeout/recovery,
+  64 back-to-back exact watermarks, empty batches, watermark-ID wrap, reset,
+  stage-specific source-loss deltas, inactive status, reserved-slot interval
+  loss, prompt malformed-watermark protocol error, and full-ring watermark
+  retention/recovery;
+- final focused stress with `TT_RT_PROFILER_SATURATION_SECONDS=0`: 16,388 of
+  16,388 records, four active devices, peak FIFO 80/32,768 pages, zero
+  transport drops, and no invalid intervals;
+- the full two-test stress suite also passed before the final scan-size
+  tightening, including slow-callback accounting. The final tightening changed
+  only watermark scan placement and was revalidated by the exact collection
+  and focused stress tests.
+
+Absolute enabled/disabled overhead distributions and the completion-observer
+sampling-period bound remain Milestone 3 qualification work.
+
+The final Milestone 2 diff and the evidence above received exact `APPROVE` from
+Claude Opus after review of device ordering, bounded behavior, host lifecycle,
+loss semantics, tests, and production resource measurements.

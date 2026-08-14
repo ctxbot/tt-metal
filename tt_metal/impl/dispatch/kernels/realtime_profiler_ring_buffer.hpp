@@ -30,6 +30,10 @@ enum RtProfilerNcriscStage : uint32_t {
     RT_PROFILER_NCRISC_STAGE_PUSHING = 5,
 };
 
+// Test-only saturation sentinel. NCRISC consults it only after the ring has
+// reached the interval-full threshold, so it adds no steady-state branch.
+constexpr uint32_t RT_PROFILER_NCRISC_TEST_PAUSE_STAGE = 0xffffffffu;
+
 struct RtProfilerNcriscDebug {
     uint32_t stage;
     uint32_t socket_config_addr;
@@ -95,6 +99,12 @@ static_assert(sizeof(RealtimeProfilerCoreL1) == sizeof(RtProfilerRingBuffer) + R
 
 inline bool rt_ring_full(volatile RtProfilerRingBuffer* rb) {
     return (rb->write_index - rb->read_index) >= RT_PROFILER_RING_CAPACITY;
+}
+
+// Keep one slot available for an ordered watermark. Interval pressure is
+// reported as transport loss instead of making batch completion itself lossy.
+inline bool rt_ring_interval_full(volatile RtProfilerRingBuffer* rb) {
+    return (rb->write_index - rb->read_index) >= RT_PROFILER_RING_CAPACITY - 1;
 }
 
 inline bool rt_ring_empty(volatile RtProfilerRingBuffer* rb) { return rb->write_index == rb->read_index; }

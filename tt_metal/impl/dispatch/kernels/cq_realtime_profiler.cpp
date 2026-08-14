@@ -39,20 +39,42 @@ volatile RtProfilerRingBuffer* ring_buffer = reinterpret_cast<volatile RtProfile
 
 // Read timestamps from dispatch_s into the next ring buffer slot
 __attribute__((noinline)) void realtime_profiler_read_and_enqueue() {
-    // Never backpressure dispatch through the mailbox acknowledgement. If the
-    // reserved-core ring is full, account the lost interval and acknowledge it.
+    // A completely full ring is transient because interval publication leaves
+    // one control slot reserved. Do not acknowledge the mailbox until NCRISC
+    // frees that slot; dispatch_s never waits for this acknowledgement.
+    if (rt_ring_full(ring_buffer) && rt_profiler_msg->terminate_requested == 0) {
+        return;
+    }
+
     if (rt_ring_full(ring_buffer)) {
+        // Termination cannot retain an occupied mailbox after the profiler
+        // core exits. Attribute the terminal control/interval loss to the same
+        // transport stage and acknowledge dispatch_s explicitly.
         ring_buffer->transport_drop_count++;
     } else {
-        uint32_t slot_addr = rt_ring_data_addr(ring_buffer, ring_buffer->write_index);
-
-        uint64_t dispatch_noc_addr = get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, DISPATCH_DATA_ADDR_B);
-
-        noc_async_read(dispatch_noc_addr, slot_addr, realtime_profiler_timestamp_size);
+        const uint32_t scratch_addr = reinterpret_cast<uint32_t>(&rt_profiler_msg->kernel_start_b);
+        const uint64_t dispatch_noc_addr = get_noc_addr(DISPATCH_CORE_NOC_X, DISPATCH_CORE_NOC_Y, DISPATCH_DATA_ADDR_B);
+        noc_async_read(dispatch_noc_addr, scratch_addr, realtime_profiler_timestamp_size);
         noc_async_read_barrier();
+        // Blackhole has no uncached L1 alias. The NOC read updated this fixed
+        // scratch region, so invalidate before BRISC reads the payload back.
+        invalidate_l1_cache();
 
-        const uint32_t id = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot_addr)[2];
-        if (id != REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID) {
+        volatile tt_l1_ptr uint32_t* scratch = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scratch_addr);
+        const uint32_t record_type = (scratch[3] >> 16) & 0xff;
+        const bool is_watermark = record_type == REALTIME_PROFILER_RECORD_TYPE_WATERMARK;
+        if (!is_watermark && rt_ring_interval_full(ring_buffer)) {
+            ring_buffer->transport_drop_count++;
+        } else if (scratch[2] != REALTIME_PROFILER_UNPROFILED_PROGRAM_HOST_ID) {
+            const uint32_t slot_addr = rt_ring_data_addr(ring_buffer, ring_buffer->write_index);
+            volatile tt_l1_ptr uint32_t* slot = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot_addr);
+            for (uint32_t i = 0; i < REALTIME_PROFILER_RECORD_WORDS; ++i) {
+                slot[i] = scratch[i];
+            }
+            if (is_watermark) {
+                slot[7] = ring_buffer->transport_drop_count;
+            }
+            asm volatile("fence w, w" ::: "memory");
             ring_buffer->write_index++;
         }
     }
