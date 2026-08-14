@@ -1434,6 +1434,13 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             start_pos = new_start_pos
         self._slots_prefilled_since_decode = set()
 
+        # vLLM sends slot_remap whenever a request's decode row stops matching the
+        # slot its device state sits in, and then records the batch as remapped. Every
+        # piece of per-slot state must move on the same step or its map is wrong for
+        # every step after, so this cannot wait for the next device-sampled step.
+        if slot_remap is not None:
+            self._apply_state_slot_remap(slot_remap)
+
         decode_kwargs = {
             "current_pos": start_pos,
             "tokens": tokens,
@@ -1468,7 +1475,6 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 reset_batch=reset_batch,
                 prompt_tokens=prompt_tokens,
                 output_tokens=output_tokens,
-                slot_remap=slot_remap,
                 enable_trace=enable_trace,
                 skip_precompile=skip_trace_precompile,
             )
@@ -1691,6 +1697,26 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             ttnn.execute_trace(self.model_args[i].mesh_device, trace_id, cq_id=0, blocking=False)
         return self.trace_output_decode[on_device_sampling]
 
+    def _apply_state_slot_remap(self, slot_remap):
+        """Move every piece of per-slot decode state to the layout ``slot_remap``
+        describes: slot ``i`` takes the state at ``slot_remap[i]``.
+
+        The seed RNG is the only such state here. It is read on device-sampled steps
+        only, but the remap has to land on the step vLLM sent it, host-sampled steps
+        included: skipping one leaves the RNG a permutation behind for every step
+        after, and no later remap describes the move that was missed.
+
+        ``slot_remap`` holds global slot indices, so each rank's seed manager takes its
+        own window; a model built without a sampling module has no state to move.
+        """
+        for i in range(self.data_parallel):
+            sampling_module = getattr(self.model[i], "sampling", None)
+            if sampling_module is None:
+                continue
+            seed_manager = sampling_module.seed_manager
+            sm_bs = seed_manager.max_batch_size
+            seed_manager.apply_slot_remap(slot_remap[i * sm_bs : (i + 1) * sm_bs])
+
     def sample_decode_on_device(
         self,
         tt_logits,
@@ -1699,7 +1725,6 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         reset_batch=False,
         prompt_tokens: torch.Tensor | None = None,
         output_tokens: torch.Tensor | None = None,
-        slot_remap=None,
         enable_trace=False,
         skip_precompile=False,
     ):
@@ -1754,11 +1779,6 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 max_seed_slots = sampling_module.seed_manager.max_batch_size
                 start_values = torch.as_tensor(start_pos[i]).reshape(-1).tolist()
                 active_seed_slots = [idx for idx, pos in enumerate(start_values[:max_seed_slots]) if int(pos) >= 0]
-            # Apply slot remap from condense before advancing seeds.
-            if slot_remap is not None:
-                sm_bs = sampling_module.seed_manager.max_batch_size
-                rank_remap = slot_remap[i * sm_bs : (i + 1) * sm_bs]
-                sampling_module.seed_manager.apply_slot_remap(rank_remap)
             # Register each request's explicit seed into the seed manager and
             # tie its RNG counter to the absolute decode position before
             # advancing. Without registration the per-request seed never reaches
