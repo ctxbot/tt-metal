@@ -268,6 +268,8 @@
   cmd: |
     export MESH_DEVICE=TG
     # GLM-5.2 256-expert MoE (device gate, DEVICE_FP32) vs the CPU MoE reference; random weights.
+    # Exercise the opt-in packed routed-expert base-tensor path on the 8x4 Galaxy.
+    export TT_ROUTED_EXPERT_CACHE_FORMAT=packed_v1
     mpirun --bind-to none --pernode --tag-output bash -lc '
       export OMP_NUM_THREADS=$(nproc)
       python3 -m pytest models/demos/deepseek_v3_d_p/tests/pcc/test_ttnn_moe.py::test_ds_moe -k "mesh-8x4 and (pcc-device-glm-256 or perf-device-glm-256)" -vvv --tb=short
