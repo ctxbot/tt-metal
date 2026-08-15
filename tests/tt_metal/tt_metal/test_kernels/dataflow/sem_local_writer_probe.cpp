@@ -4,7 +4,7 @@
 
 // Provably-local sole writer: increments sem::counter with the plain-local up() only, then
 // reports {baked scope, value}. Unlike the census probe, it never takes the semaphore's raw
-// ring address, so the usage probe classifies it LOCAL_WRITER -- the class the gap-3
+// ring address, so the usage check classifies it LOCAL_WRITER -- the class the gap-3
 // refinement requires before letting a read-only remote observer ride along on the plain word.
 
 #include "api/dataflow/dataflow_api.h"

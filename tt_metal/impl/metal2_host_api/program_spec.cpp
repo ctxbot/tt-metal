@@ -291,24 +291,24 @@ TensorBindingsForKernel ResolveTensorBindingsForKernel(
     uint32_t base_cta_offset);
 
 // ============================================================================
-// Semaphore usage probe (refines would-be-EXTERNAL semaphores only)
+// Semaphore usage check (refines would-be-EXTERNAL semaphores only)
 // ============================================================================
 //
-// The census alone must treat every binder as a potential writer. The probe recovers the
+// The census alone must treat every binder as a potential writer. The check recovers the
 // missing access bits for two shapes -- "this binding provably never writes" and "this
 // binding's ONLY op is the pinned-channel remote up()" -- by asking the COMPILER, not by
 // reading source text: the kernel TU is compiled frontend-only (-fsyntax-only, never linked or
 // run) with the generated sem:: ids emitted as tag types and every Semaphore method
-// deprecation-poisoned (noc_semaphore.h, TT_SEM_USAGE_PROBE), so the diagnostics name every
+// deprecation-poisoned (noc_semaphore.h, TT_SEM_USAGE_CHECK), so the diagnostics name every
 // operation and the semaphore it touches -- through any spelling, macro, helper include or
-// user -D/-I option, because the probe sees exactly what the real build would. It is
+// user -D/-I option, because the check sees exactly what the real build would. It is
 // deliberately conservative: a failed compile, an unattributable diagnostic, a raw
-// get_semaphore() take in kernel code, or a diagnostic-suppressing pragma / probe-conditioning
+// get_semaphore() take in kernel code, or a diagnostic-suppressing pragma / check-conditioning
 // token in an untrusted file of the include closure classifies as WRITER, which keeps today's
 // EXTERNAL pick. Misclassification can therefore only cost performance, never correctness --
 // with ONE documented boundary: a kernel that deliberately INTROSPECTS semaphore internals to
-// detect the probe environment (SFINAE on the tag types' size/traits, on sem_scope_of's
-// constexpr-ness, on the relays' probe-mode absence) can launder ops past classification. That
+// detect the check environment (SFINAE on the tag types' size/traits, on sem_scope_of's
+// constexpr-ness, on the relays' check-mode absence) can launder ops past classification. That
 // is not a supportable threat model -- it is the moral equivalent of declaring false bindings,
 // which no build-time analysis (textual or compiled) can survive -- and the in-tree hygiene
 // lint's raw-access/construction rules keep such machinery out of this repo.
@@ -319,14 +319,14 @@ enum class SemAccessClass : uint8_t {
     WRITER,          // anything unprovable or mixed: the conservative default
 };
 
-// JitBuildSettings view of a KernelSpec for the usage probe: enough for the generated headers
+// JitBuildSettings view of a KernelSpec for the usage check: enough for the generated headers
 // and the compile command to match what the real kernel build would see (same defines, same
-// include paths, same binding names). The sem section is emitted in probe form
-// (is_sem_usage_probe); the scopes passed here are placeholders -- the probe runs BEFORE the
+// include paths, same binding names). The sem section is emitted in check form
+// (is_sem_usage_check); the scopes passed here are placeholders -- the check runs BEFORE the
 // refinement and feeds it. Numeric handle values (DFB slots, tensor offsets) only shape
 // generated constants, never semaphore classification, so placeholders are fine for the ones
 // that are not resolved yet.
-struct SemProbeSettings final : public JitBuildSettings {
+struct SemCheckSettings final : public JitBuildSettings {
     std::string full_name;
     const KernelSpec* spec = nullptr;
     const DFBNameToSlotMap* dfb_slots = nullptr;
@@ -335,24 +335,24 @@ struct SemProbeSettings final : public JitBuildSettings {
     std::vector<std::string> crta_names;
     std::vector<std::string> include_paths;
     std::unordered_map<std::string, uint32_t> named_ctas;
-    TensorBindingsForKernel tensor_bindings;  // REAL resolved bindings: the probe TU's constants
+    TensorBindingsForKernel tensor_bindings;  // REAL resolved bindings: the check TU's constants
                                               // must match what the real kernel build will see
 
     const std::string& get_full_kernel_name() const override { return full_name; }
     // Mirror the spec's opt level (the real kernels do the same): __OPTIMIZE__-family macros
-    // are observable, so the probe must not diverge.
+    // are observable, so the check must not diverge.
     std::string_view get_compiler_opt_level() const override {
         return enchantum::to_string(spec->compiler_options.opt_level);
     }
     std::string_view get_linker_opt_level() const override { return get_compiler_opt_level(); }
     bool is_metal2_kernel() const override { return true; }
-    bool is_sem_usage_probe() const override { return true; }
+    bool is_sem_usage_check() const override { return true; }
     void process_defines(std::function<void(const std::string&, const std::string&)> cb) const override {
         for (const auto& [name, value] : spec->compiler_options.defines) {
             cb(name, value);
         }
         // Exactly what QuasarDataMovementKernel::process_defines adds (kernel.cpp): the TU does
-        // not compile without them, and the probe must mirror the real build.
+        // not compile without them, and the check must mirror the real build.
         cb("NOC_INDEX", std::to_string(NOC::NOC_0));
         cb("NOC_MODE", std::to_string(NOC_MODE::DM_DEDICATED_NOC));
     }
@@ -405,16 +405,16 @@ struct SemProbeSettings final : public JitBuildSettings {
     KernelCrtaLayout get_crta_layout() const override { return tensor_bindings.crta_layout; }
 };
 
-// One probe outcome per kernel: per-accessor op sets, or fully conservative.
-struct SemProbeOutcome {
+// One check outcome per kernel: per-accessor op sets, or fully conservative.
+struct SemCheckOutcome {
     bool conservative = false;
-    std::string reason;  // first conservative trigger, for the probe.result record
+    std::string reason;  // first conservative trigger, for the check.result record
     std::unordered_map<std::string, std::set<std::string>> accessor_ops;
 };
 
 // Resolve a compiler-reported path (diagnostic location or .d dependency) to canonical absolute
-// form: the probe compile runs with cwd = its target dir, so relative paths resolve there.
-std::string ResolveProbePath(const std::filesystem::path& target_dir, const std::string& p) {
+// form: the check compile runs with cwd = its target dir, so relative paths resolve there.
+std::string ResolveCheckPath(const std::filesystem::path& target_dir, const std::string& p) {
     std::error_code ec;
     const std::filesystem::path fp(p);
     const auto abs = fp.is_absolute() ? std::filesystem::weakly_canonical(fp, ec)
@@ -431,14 +431,14 @@ bool PathHasTrustedPrefix(const std::string& path, const std::vector<std::string
     return false;
 }
 
-// Parse the probe compile log: every relevant diagnostic carries TT_SEM_USE:<op>, and tagged
+// Parse the check compile log: every relevant diagnostic carries TT_SEM_USE:<op>, and tagged
 // ones name their semaphore as sem::<accessor>_t. Diagnostics located inside trusted headers
-// are the poisoned symbols' own internal uses (e.g. the probe-split 4-arg up() forwarding to
+// are the poisoned symbols' own internal uses (e.g. the check-split 4-arg up() forwarding to
 // the 5-arg form) and are dropped; anything at an untrusted location that cannot be attributed
 // to a tag flips the whole kernel conservative.
-SemProbeOutcome ParseSemProbeLog(
+SemCheckOutcome ParseSemCheckLog(
     const std::string& log_path, const std::filesystem::path& target_dir, const std::vector<std::string>& trusted) {
-    SemProbeOutcome out;
+    SemCheckOutcome out;
     std::ifstream log(log_path);
     if (!log) {
         out.conservative = true;
@@ -449,7 +449,7 @@ SemProbeOutcome ParseSemProbeLog(
     const std::regex tag_re("sem::([A-Za-z_][A-Za-z0-9_]*)_t");
     std::string line;
     while (std::getline(log, line)) {
-        const std::string location = ResolveProbePath(target_dir, line.substr(0, line.find(':')));
+        const std::string location = ResolveCheckPath(target_dir, line.substr(0, line.find(':')));
         const bool trusted_loc = PathHasTrustedPrefix(location, trusted);
         // A kernel-defined template over semaphores can make the compiler DEDUPLICATE
         // per-location diagnostics across instantiations, silently swallowing a second tag's
@@ -500,7 +500,7 @@ SemProbeOutcome ParseSemProbeLog(
 }
 
 // Fold one accessor's op set into the class the refinement consumes.
-SemAccessClass FoldSemProbeOps(const std::set<std::string>& ops) {
+SemAccessClass FoldSemCheckOps(const std::set<std::string>& ops) {
     bool any_read = false, any_local_write = false, any_remote_up = false;
     for (const auto& op : ops) {
         if (op == "bind") {
@@ -527,10 +527,10 @@ SemAccessClass FoldSemProbeOps(const std::set<std::string>& ops) {
 }
 
 // The one narrow suppression backstop: '#pragma GCC diagnostic ignored' (or _Pragma) in an
-// UNTRUSTED file of the probe's include closure silences the poison and no compiler flag
+// UNTRUSTED file of the check's include closure silences the poison and no compiler flag
 // overrides it, so its presence makes the kernel unprovable. Trusted repo/toolchain headers
 // legitimately use diagnostic pragmas and are exempt.
-bool ProbeClosureSuppressesDiagnostics(
+bool CheckClosureSuppressesDiagnostics(
     const std::string& dep_path, const std::filesystem::path& target_dir, const std::vector<std::string>& trusted) {
     std::ifstream dep(dep_path);
     if (!dep) {
@@ -539,7 +539,7 @@ bool ProbeClosureSuppressesDiagnostics(
     const auto deps = jit_build::parse_dependency_file(dep);
     for (const auto& [obj, files] : deps) {
         for (const auto& raw : files) {
-            const std::string f = ResolveProbePath(target_dir, raw);
+            const std::string f = ResolveCheckPath(target_dir, raw);
             if (PathHasTrustedPrefix(f, trusted)) {
                 continue;
             }
@@ -548,13 +548,13 @@ bool ProbeClosureSuppressesDiagnostics(
                 return true;
             }
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            // Any of these in an external file can make the probe see different code than the
+            // Any of these in an external file can make the check see different code than the
             // real build (or silence the poison): whitespace-tolerant diagnostic pragmas,
-            // _Pragma operators, conditioning on the probe define itself, or per-processor
-            // arms (the probe compiles ONE canonical DM variant).
+            // _Pragma operators, conditioning on the check define itself, or per-processor
+            // arms (the check compiles ONE canonical DM variant).
             static const std::regex suppress_re("(#|%:)\\s*pragma\\s+GCC\\s+diagnostic");
             if (std::regex_search(text, suppress_re) || text.find("_Pragma") != std::string::npos ||
-                text.find("TT_SEM_USAGE_PROBE") != std::string::npos ||
+                text.find("TT_SEM_USAGE_CHECK") != std::string::npos ||
                 text.find("COMPILE_FOR_DM") != std::string::npos ||
                 text.find("TT_METAL2_SEM_SCOPE_TABLE") != std::string::npos ||
                 text.find("FULL_KERNEL_NAME") != std::string::npos) {
@@ -565,12 +565,12 @@ bool ProbeClosureSuppressesDiagnostics(
     return false;
 }
 
-// Run (or reuse) the usage probe for one kernel: emit the probe genfiles, compile the real
+// Run (or reuse) the usage check for one kernel: emit the check genfiles, compile the real
 // kernel TU frontend-only with the poisoned surface, parse the diagnostics into per-accessor
 // classes. Returns nullopt when the kernel is fully conservative (compile failure included).
-// Outcomes cache on the probe's own dependency-closure hash + command stamp, so a program
+// Outcomes cache on the check's own dependency-closure hash + command stamp, so a program
 // rebuild with unchanged sources costs no compiler invocation.
-std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
+std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageCheck(
     distributed::MeshDevice& mesh_device,
     const KernelSpec& kernel_spec,
     const DFBNameToSlotMap& dfb_name_to_slot,
@@ -578,7 +578,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     const std::unordered_map<TensorParamName, ResolvedTensorParameter>& resolved_tensor_parameters) {
     // Inline SourceCode kernels are textually pasted into the (trusted) generated
     // kernel_includes.hpp, so their diagnostics cannot be distinguished from generated code:
-    // no probe, conservative (they simply keep EXTERNAL).
+    // no check, conservative (they simply keep EXTERNAL).
     if (std::holds_alternative<KernelSpec::SourceCode>(kernel_spec.source)) {
         return std::nullopt;
     }
@@ -587,7 +587,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     if (!kernel_spec.is_data_movement_kernel()) {
         return std::nullopt;
     }
-    // Probe identity: everything that can change what the compiler sees.
+    // Check identity: everything that can change what the compiler sees.
     std::ostringstream ident;
     std::visit(
         [&](const auto& s) {
@@ -633,8 +633,11 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     for (const auto& n : kernel_spec.runtime_arg_schema.common_runtime_arg_names) {
         ident << ";c=" << n;
     }
-    std::ostringstream probe_name;
-    probe_name << "semprobe_" << std::hex << std::hash<std::string>{}(ident.str());
+    for (const auto& v : kernel_spec.advanced_options.compile_time_varargs) {
+        ident << ";v=" << v;
+    }
+    std::ostringstream check_name;
+    check_name << "semcheck_" << std::hex << std::hash<std::string>{}(ident.str());
 
     const ContextId ctx = extract_context_id(&mesh_device);
     auto& bem = BuildEnvManager::get_instance(ctx);
@@ -665,8 +668,8 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     const std::vector<std::string> pragma_exempt =
         canonicalize({root, "/opt/tenstorrent/sfpi/", env.get_out_kernel_root_path()});
 
-    SemProbeSettings ps;
-    ps.full_name = probe_name.str();
+    SemCheckSettings ps;
+    ps.full_name = check_name.str();
     ps.spec = &kernel_spec;
     ps.dfb_slots = &dfb_name_to_slot;
     ps.sem_ids = &semaphore_name_to_id;
@@ -679,36 +682,33 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     for (const auto& [name, value] : kernel_spec.compile_time_args) {
         ps.named_ctas.emplace(name, value);
     }
-    for (const auto& v : kernel_spec.advanced_options.compile_time_varargs) {
-        ident << ";v=" << v;
-    }
     for (const auto& p : kernel_spec.compiler_options.include_paths) {
         ps.include_paths.push_back(p.string());
     }
     ps.tensor_bindings = ta_bindings;
 
     const std::string gen_dir = env.get_out_kernel_root_path() + ps.full_name + "/";
-    const std::string target_dir = gen_dir + "probe/";
+    const std::string target_dir = gen_dir + "check/";
     std::filesystem::create_directories(target_dir);
-    // Concurrent builds may probe the same kernel (the cache root is shared, sometimes a
+    // Concurrent builds may check the same kernel (the cache root is shared, sometimes a
     // network mount): compile artifacts are per-process, and the shared-name cache files are
     // only ever REPLACED via atomic rename, so a reader always sees one writer's consistent
     // (stamp, ops) pair -- never a torn or half-written record.
-    char probe_host[64] = {};
-    ::gethostname(probe_host, sizeof(probe_host) - 1);
-    const std::string uniq = std::string(probe_host) + "_" + std::to_string(static_cast<long>(::getpid())) + "_" +
+    char check_host[64] = {};
+    ::gethostname(check_host, sizeof(check_host) - 1);
+    const std::string uniq = std::string(check_host) + "_" + std::to_string(static_cast<long>(::getpid())) + "_" +
                              std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-    const std::string obj_path = target_dir + "probe_" + uniq + ".o";
-    const std::string dep_path = target_dir + "probe_" + uniq + ".d";
-    const std::string log_path = target_dir + "probe_" + uniq + ".log";
-    const std::string result_path = target_dir + "probe.result";
-    const std::string hash_path = target_dir + "probe.dephash";
+    const std::string obj_path = target_dir + "check_" + uniq + ".o";
+    const std::string dep_path = target_dir + "check_" + uniq + ".d";
+    const std::string log_path = target_dir + "check_" + uniq + ".log";
+    const std::string result_path = target_dir + "check.result";
+    const std::string hash_path = target_dir + "check.dephash";
 
     const KernelSource kernel_src = MakeKernelSource(kernel_spec, ctx);
     if (kernel_src.source_type_ == KernelSource::SourceType::FILE_PATH) {
         // Mirror the real kernel build: the kernel's own directory is an include path (FIRST,
         // like Kernel::process_include_paths), so its quoted local includes resolve identically
-        // (and land in the probed closure).
+        // (and land in the checkd closure).
         ps.include_paths.insert(
             ps.include_paths.begin(), std::filesystem::path(kernel_src.path_).parent_path().string());
     }
@@ -716,12 +716,12 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     // Build the exact command up front: its stamp is part of the cache key.
     tt::jit_build::TargetRecipe recipe = bs.export_target_recipe(&ps);
     // Frontend only; -Wsystem-headers restores diagnostics a '#pragma GCC system_header' would
-    // hide; blanket -Wno-error because the probe never ships a binary -- stray warnings in
+    // hide; blanket -Wno-error because the check never ships a binary -- stray warnings in
     // system headers must not fail the compile (real errors still do).
     const std::string cflags = recipe.cflags + " -fsyntax-only -Wsystem-headers -Wno-error";
     std::vector<std::string> defines = recipe.defines;  // each element is a full "-DX=Y" token
-    defines.push_back("-DTT_SEM_USAGE_PROBE=1");
-    TT_FATAL(!recipe.srcs.empty(), "semaphore usage probe: target {} has no source", recipe.target_name);
+    defines.push_back("-DTT_SEM_USAGE_CHECK=1");
+    TT_FATAL(!recipe.srcs.empty(), "semaphore usage check: target {} has no source", recipe.target_name);
     const std::vector<std::string> argv = jit_build::utils::build_gpp_argv(
         env.get_gpp(),
         recipe.compiler_opt_level,
@@ -740,8 +740,8 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     }
     const std::string stamp = std::to_string(std::hash<std::string>{}(stamp_src.str()));
 
-    // Cached outcome: valid while the command and the probed include closure are unchanged.
-    const auto load_cached = [&]() -> std::optional<SemProbeOutcome> {
+    // Cached outcome: valid while the command and the checkd include closure are unchanged.
+    const auto load_cached = [&]() -> std::optional<SemCheckOutcome> {
         std::ifstream in(result_path);
         if (!in) {
             return std::nullopt;
@@ -750,7 +750,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
         if (!std::getline(in, cached_stamp) || cached_stamp != stamp || !std::getline(in, status)) {
             return std::nullopt;
         }
-        SemProbeOutcome out;
+        SemCheckOutcome out;
         out.conservative = (status.rfind("conservative", 0) == 0);
         std::string accessor, op;
         while (in >> accessor >> op) {
@@ -758,7 +758,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
         }
         return out;
     };
-    std::optional<SemProbeOutcome> outcome;
+    std::optional<SemCheckOutcome> outcome;
     if (jit_build::dependencies_up_to_date_file(hash_path)) {
         outcome = load_cached();
     }
@@ -767,13 +767,13 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
         jit_build_genfiles_kernel_include(env, ps, kernel_src);
         std::filesystem::remove(log_path);  // exec_command appends: stale diagnostics must not fold in
         const bool ok = jit_build::utils::exec_command(argv, target_dir, log_path);
-        SemProbeOutcome fresh;
+        SemCheckOutcome fresh;
         if (!ok) {
             fresh.conservative = true;  // does not compile as the real build would: unprovable
             fresh.reason = "compile-failed";
         } else {
-            fresh = ParseSemProbeLog(log_path, target_dir, poison_internal);
-            if (!fresh.conservative && ProbeClosureSuppressesDiagnostics(dep_path, target_dir, pragma_exempt)) {
+            fresh = ParseSemCheckLog(log_path, target_dir, poison_internal);
+            if (!fresh.conservative && CheckClosureSuppressesDiagnostics(dep_path, target_dir, pragma_exempt)) {
                 fresh.conservative = true;
                 fresh.reason = "pragma-closure";
             }
@@ -797,7 +797,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
                 const std::string ktext((std::istreambuf_iterator<char>(kin)), std::istreambuf_iterator<char>());
                 static const std::regex kernel_suppress_re("(#|%:)\\s*pragma\\s+GCC\\s+diagnostic");
                 if (std::regex_search(ktext, kernel_suppress_re) || ktext.find("_Pragma") != std::string::npos ||
-                    ktext.find("TT_SEM_USAGE_PROBE") != std::string::npos ||
+                    ktext.find("TT_SEM_USAGE_CHECK") != std::string::npos ||
                     ktext.find("COMPILE_FOR_DM") != std::string::npos ||
                     ktext.find("TT_METAL2_SEM_SCOPE_TABLE") != std::string::npos ||
                     ktext.find("FULL_KERNEL_NAME") != std::string::npos) {
@@ -827,7 +827,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
             std::filesystem::rename(hash_tmp, hash_path, ec);
         }
         {
-            std::error_code ec;  // always: failed probes re-run every build and must not accrete
+            std::error_code ec;  // always: failed checks re-run every build and must not accrete
             std::filesystem::remove(obj_path, ec);
             std::filesystem::remove(dep_path, ec);
             std::filesystem::remove(log_path, ec);
@@ -842,7 +842,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
     for (const auto& b : kernel_spec.semaphore_bindings) {
         const auto it = outcome->accessor_ops.find(b.accessor_name);
         classes[b.accessor_name] =
-            (it == outcome->accessor_ops.end()) ? SemAccessClass::READ_ONLY : FoldSemProbeOps(it->second);
+            (it == outcome->accessor_ops.end()) ? SemAccessClass::READ_ONLY : FoldSemCheckOps(it->second);
     }
     return classes;
 }
@@ -857,7 +857,7 @@ std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
 //   Gen2, single-node sem, all binders   -> DM_LOCAL_CACHED (node-local AMO; any number of
 //         DM kernels confined to it         binder kernels/threads)
 //   anything else (off-node reach)       -> EXTERNAL (self-targeted NoC atomic)
-// An EXTERNAL result is not necessarily final: the usage-probe refinement downstream (see
+// An EXTERNAL result is not necessarily final: the usage-check refinement downstream (see
 // the gap-3/gap-8 arms in BuildProgramFromSpec) may downgrade it to LOCAL_NONATOMIC /
 // REMOTE_POSTED when the compiler frontend can PROVE the writes cannot race.
 SemScope ResolveSemaphoreScope(const SemaphoreSpec& sem, const CollectedSpecData::SemaphoreBinderInfo& binders) {
@@ -3753,9 +3753,9 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
             ResolveSemaphoreScope(semaphore_spec, SemaphoreBinders(collected, semaphore_name));
     }
 
-    // Usage-probe refinement of would-be-EXTERNAL semaphores ONLY (never touches LOCAL/CACHED
-    // picks). Two shapes escape the NoC-atomic tax when the compiler-frontend probe can PROVE
-    // the access pattern (anything unprovable stays EXTERNAL -- see RunSemUsageProbe):
+    // Usage-check refinement of would-be-EXTERNAL semaphores ONLY (never touches LOCAL/CACHED
+    // picks). Two shapes escape the NoC-atomic tax when the compiler-frontend check can PROVE
+    // the access pattern (anything unprovable stays EXTERNAL -- see RunSemUsageCheck):
     //   gap 3: sole LOCAL_WRITER (1 instance) ON the sem's node, every other binder read-only
     //          -> everyone bakes LOCAL_NONATOMIC (the plain word is already NoC-readable).
     //   gap 8: sole REMOTE_UP_ONLY writer (1 instance) OFF the sem's node, every other binder
@@ -3767,15 +3767,15 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
     std::unordered_map<SemaphoreSpecName, const KernelSpec*> sem_posted_writer;
     if (is_gen2_arch() && cached_tier_available()) {
         std::unordered_map<const KernelSpec*, std::optional<std::unordered_map<std::string, SemAccessClass>>>
-            probe_cache;
+            check_cache;
         auto kernel_access_classes =
             [&](const KernelSpec* k) -> const std::optional<std::unordered_map<std::string, SemAccessClass>>& {
-            auto it = probe_cache.find(k);
-            if (it == probe_cache.end()) {
-                it = probe_cache
+            auto it = check_cache.find(k);
+            if (it == check_cache.end()) {
+                it = check_cache
                          .emplace(
                              k,
-                             RunSemUsageProbe(
+                             RunSemUsageCheck(
                                  mesh_device, *k, dfb_name_to_slot, semaphore_name_to_id, resolved_tensor_parameters))
                          .first;
             }

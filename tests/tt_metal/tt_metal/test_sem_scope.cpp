@@ -35,7 +35,7 @@ namespace tt::tt_metal {
 // DM_LOCAL_CACHED (32-bit AMO on the cached alias), EXTERNAL (self-targeted
 // NoC atomic), REMOTE_POSTED (sole off-node writer's staged plain writes).
 // The host resolves each semaphore's mechanism from a binder-topology census
-// plus a conservative compiler-frontend usage probe (program_spec.cpp) --
+// plus a conservative compiler-frontend usage check (program_spec.cpp) --
 // nothing is configurable on the SemaphoreSpec -- so every test here
 // constructs the SHAPE (topology + provable source) that makes the host pick
 // the mechanism under test. Raw hardware atomicity is covered by the keystone
@@ -793,7 +793,7 @@ TEST_F(SemScopeFixture, TestCachedExternalCoexistence) {
 // manifests as a hang; the exact-count EXPECTs catch overshoot and wrong-word landings.
 
 // GAP-8 KEYSTONE: one off-node sender thread whose only op is the pinned-channel remote up(),
-// plus a provably read-only receiver -- the usage probe proves the shape, so the sender bakes
+// plus a provably read-only receiver -- the usage check proves the shape, so the sender bakes
 // REMOTE_POSTED (private running count, staged in its CAS-return slot, delivered by plain
 // 4B writes -- NOT the inline-dw primitive, which hangs on this RTL) and the receiver bakes
 // LOCAL_NONATOMIC. BOTH baked scopes are asserted (the sender reports its own table entry, so

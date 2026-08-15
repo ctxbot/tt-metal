@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Pure read-only observer: binds sem::counter and only reads it once. The usage probe
+// Pure read-only observer: binds sem::counter and only reads it once. The usage check
 // proves this binding read-only, so its presence never forces an atomic mechanism -- used by
 // the gap-3 census pin (sole on-node writer + off-node observer must stay LOCAL_NONATOMIC).
 

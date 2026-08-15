@@ -225,10 +225,10 @@ bool write_kernel_bindings_generated_header(
             content << "}  // namespace dfb\n";
         }
 
-        if (!sem_entries.empty() && settings.is_sem_usage_probe()) {
-            // USAGE-PROBE build (frontend-only, never runs): ids as poisoned tag types so the
+        if (!sem_entries.empty() && settings.is_sem_usage_check()) {
+            // USAGE-CHECK build (frontend-only, never runs): ids as poisoned tag types so the
             // compiler reports every semaphore op. No stubs, no tripwires.
-            tt::tt_metal::emit_sem_probe_bindings(content, sem_entries);
+            tt::tt_metal::emit_sem_check_bindings(content, sem_entries);
             content << "}  // namespace sem\n";
         } else if (!sem_entries.empty()) {
             // Each bound semaphore is its plain id; the mechanism travels in the scope table
