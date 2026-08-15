@@ -7,7 +7,6 @@
 #include <optional>
 
 #include <tt-metalium/global_semaphore.hpp>
-#include <tt-metalium/mesh_device.hpp>
 
 namespace tt::tt_metal::experimental {
 // clang-format off

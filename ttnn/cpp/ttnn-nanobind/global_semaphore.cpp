@@ -17,7 +17,6 @@ namespace ttnn::global_semaphore {
 void py_module_types(nb::module_& mod) { nb::class_<GlobalSemaphore>(mod, "global_semaphore"); }
 
 void py_module(nb::module_& mod) {
-    // Single Device Creation API
     mod.def(
         "create_global_semaphore",
         &ttnn::global_semaphore::create_global_semaphore,
@@ -26,28 +25,10 @@ void py_module(nb::module_& mod) {
         nb::arg("initial_value"),
         nb::arg("buffer_type") = nb::cast(tt::tt_metal::BufferType::L1),
         R"doc(
-            Create a GlobalSemaphore Object on a single device.
+            Create a GlobalSemaphore Object on a device.
 
             Args:
                 device (Device): The device on which to create the global semaphore.
-                cores (CoreRangeSet): The cores on which the global semaphore will be used for synchronization.
-                initial_value (int): The initial value of the global semaphore.
-                buffer_type (BufferType): The type of buffer to use for the global semaphore.
-            )doc");
-
-    // MeshDevice Creation API
-    mod.def(
-        "create_global_semaphore",
-        &ttnn::global_semaphore::create_global_semaphore,
-        nb::arg("mesh_device"),
-        nb::arg("cores"),
-        nb::arg("initial_value"),
-        nb::arg("buffer_type") = nb::cast(tt::tt_metal::BufferType::L1),
-        R"doc(
-            Create a GlobalSemaphore Object on a single device.
-
-            Args:
-                mesh_device (MeshDevice): The mesh device on which to create the global semaphore.
                 cores (CoreRangeSet): The cores on which the global semaphore will be used for synchronization.
                 initial_value (int): The initial value of the global semaphore.
                 buffer_type (BufferType): The type of buffer to use for the global semaphore.

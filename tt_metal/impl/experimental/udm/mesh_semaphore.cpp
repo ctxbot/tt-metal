@@ -27,7 +27,6 @@ MeshSemaphoreHandle CreateMeshSemaphore(MeshBuilder& builder, MeshProgram& /* pr
 
     // Create a GlobalSemaphore across all devices in the mesh
     auto* mesh_device = builder.mesh_device();
-    TT_FATAL(mesh_device != nullptr, "MeshDevice cannot be null");
     auto global_semaphore = tt::tt_metal::GlobalSemaphore(*mesh_device, local_cores, initial_value);
 
     // Synchronize mesh device after creating global semaphore

@@ -4,11 +4,8 @@
 
 #include "ttnn/global_semaphore.hpp"
 
-#include <algorithm>
-#include <tt-metalium/host_api.hpp>
 #include <tt-metalium/global_semaphore.hpp>
 #include <tt_stl/assert.hpp>
-#include <tt_stl/span.hpp>
 
 namespace ttnn::global_semaphore {
 
@@ -18,7 +15,6 @@ MultiDeviceGlobalSemaphore::MultiDeviceGlobalSemaphore(size_t num_devices) {
 
 GlobalSemaphore create_global_semaphore(
     MeshDevice* mesh_device, const CoreRangeSet& cores, uint32_t initial_value, BufferType buffer_type) {
-    TT_FATAL(mesh_device != nullptr, "MeshDevice cannot be null");
     return GlobalSemaphore(*mesh_device, cores, initial_value, buffer_type);
 }
 
