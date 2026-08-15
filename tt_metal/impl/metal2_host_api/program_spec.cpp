@@ -26,6 +26,14 @@
 #include <tt-metalium/experimental/metal2_host_api/program.hpp>
 #include <hostdevcommon/tensor_accessor/arg_config.hpp>
 #include "impl/kernels/kernel.hpp"
+#include "impl/context/context_types.hpp"
+#include "jit_build/build_env_manager.hpp"
+#include "jit_build/genfiles.hpp"
+#include "jit_build/jit_build_utils.hpp"
+#include "jit_build/depend.hpp"
+#include <regex>
+#include <unistd.h>
+#include <thread>
 #include "impl/program/program_impl.hpp"
 #include "impl/context/metal_context.hpp"
 #include "impl/context/metal_env_accessor.hpp"
@@ -253,18 +261,57 @@ bool cached_tier_available() {
     return MetalContext::instance().rtoptions().get_target_device() != tt::TargetDevice::Emule;
 }
 
+// Forward declarations (defined with the other spec helpers below).
+KernelSource MakeKernelSource(const KernelSpec& kernel_spec, ContextId context_id);
+struct ResolvedTensorParameter {
+    std::vector<uint32_t> cta_payload;
+
+    // How many CRTA words (beyond the base address) does this binding consume?
+    // This is only used if TensorParameter relaxations have been requested.
+    uint32_t extra_crta_words = 0;
+
+    // What info the runtime field CRTA words actually contain depends on the relaxation.
+    // Currently, there are only two mutually exclusive possibilities (though more may be added):
+    //  1. The interleaved row-major page-size (one CRTA only)
+    //  2. The sharded dynamic_tensor_shape shape (one CRTA per tensor dim)
+    // For now, since there are only two mutually exclusive possibilities, it's sufficient to
+    // distinguish them with a boolean.
+    bool runtime_field_is_page_size = false;
+};
+struct TensorBindingsForKernel {
+    std::vector<TensorBindingHandle> handles;
+    // Binding-only CTA payload; appended after the user CTA-vararg positional prefix.
+    std::vector<uint32_t> cta_words;
+    KernelCrtaLayout crta_layout;
+};
+TensorBindingsForKernel ResolveTensorBindingsForKernel(
+    const KernelSpec& kernel_spec,
+    const std::unordered_map<TensorParamName, ResolvedTensorParameter>& resolved_tensor_parameters,
+    size_t base_named_crta_count,
+    uint32_t base_cta_offset);
+
 // ============================================================================
-// Conservative semaphore-access scan (refines would-be-EXTERNAL semaphores only)
+// Semaphore usage probe (refines would-be-EXTERNAL semaphores only)
 // ============================================================================
 //
-// The census alone must treat every binder as a potential writer. This scan recovers the one
-// missing bit for two shapes -- "this binding provably never writes" and "this binding's ONLY
-// op is the remote up()" -- by reading the kernel source. It is deliberately conservative:
-// anything it cannot prove (aliasing, escapes, helper includes outside api/experimental,
-// unreadable source) classifies as WRITER, which keeps today's EXTERNAL pick. Misclassification
-// can therefore only cost performance, never correctness. Hygiene backstop: the Metal 2.0
-// source lint (a TEST-SUITE guard, not a build-time gate) bans raw semaphore access and
-// non-sem:: construction in kernels -- the scan is written NOT to rely on it.
+// The census alone must treat every binder as a potential writer. The probe recovers the
+// missing access bits for two shapes -- "this binding provably never writes" and "this
+// binding's ONLY op is the pinned-channel remote up()" -- by asking the COMPILER, not by
+// reading source text: the kernel TU is compiled frontend-only (-fsyntax-only, never linked or
+// run) with the generated sem:: ids emitted as tag types and every Semaphore method
+// deprecation-poisoned (noc_semaphore.h, TT_SEM_USAGE_PROBE), so the diagnostics name every
+// operation and the semaphore it touches -- through any spelling, macro, helper include or
+// user -D/-I option, because the probe sees exactly what the real build would. It is
+// deliberately conservative: a failed compile, an unattributable diagnostic, a raw
+// get_semaphore() take in kernel code, or a diagnostic-suppressing pragma / probe-conditioning
+// token in an untrusted file of the include closure classifies as WRITER, which keeps today's
+// EXTERNAL pick. Misclassification can therefore only cost performance, never correctness --
+// with ONE documented boundary: a kernel that deliberately INTROSPECTS semaphore internals to
+// detect the probe environment (SFINAE on the tag types' size/traits, on sem_scope_of's
+// constexpr-ness, on the relays' probe-mode absence) can launder ops past classification. That
+// is not a supportable threat model -- it is the moral equivalent of declaring false bindings,
+// which no build-time analysis (textual or compiled) can survive -- and the in-tree hygiene
+// lint's raw-access/construction rules keep such machinery out of this repo.
 enum class SemAccessClass : uint8_t {
     READ_ONLY,       // provably never writes (reads/waits only, or never touches the accessor)
     LOCAL_WRITER,    // provably writes ONLY via the plain-local forms (single-arg up/down/set)
@@ -272,292 +319,205 @@ enum class SemAccessClass : uint8_t {
     WRITER,          // anything unprovable or mixed: the conservative default
 };
 
-// Strip comments and string/char literal contents (mirror of the hygiene lint's stripper).
-std::string StripCommentsForSemScan(const std::string& text) {
-    std::string out;
-    out.reserve(text.size());
-    bool in_block = false, in_line = false, in_str = false, in_chr = false;
-    for (size_t i = 0; i < text.size(); i++) {
-        const char c = text[i];
-        if (in_line) {
-            if (c == '\n') {
-                in_line = false;
-                out += '\n';
+// JitBuildSettings view of a KernelSpec for the usage probe: enough for the generated headers
+// and the compile command to match what the real kernel build would see (same defines, same
+// include paths, same binding names). The sem section is emitted in probe form
+// (is_sem_usage_probe); the scopes passed here are placeholders -- the probe runs BEFORE the
+// refinement and feeds it. Numeric handle values (DFB slots, tensor offsets) only shape
+// generated constants, never semaphore classification, so placeholders are fine for the ones
+// that are not resolved yet.
+struct SemProbeSettings final : public JitBuildSettings {
+    std::string full_name;
+    const KernelSpec* spec = nullptr;
+    const DFBNameToSlotMap* dfb_slots = nullptr;
+    const SemaphoreNameToIdMap* sem_ids = nullptr;
+    std::vector<std::string> rta_names;
+    std::vector<std::string> crta_names;
+    std::vector<std::string> include_paths;
+    std::unordered_map<std::string, uint32_t> named_ctas;
+    TensorBindingsForKernel tensor_bindings;  // REAL resolved bindings: the probe TU's constants
+                                              // must match what the real kernel build will see
+
+    const std::string& get_full_kernel_name() const override { return full_name; }
+    // Mirror the spec's opt level (the real kernels do the same): __OPTIMIZE__-family macros
+    // are observable, so the probe must not diverge.
+    std::string_view get_compiler_opt_level() const override {
+        return enchantum::to_string(spec->compiler_options.opt_level);
+    }
+    std::string_view get_linker_opt_level() const override { return get_compiler_opt_level(); }
+    bool is_metal2_kernel() const override { return true; }
+    bool is_sem_usage_probe() const override { return true; }
+    void process_defines(std::function<void(const std::string&, const std::string&)> cb) const override {
+        for (const auto& [name, value] : spec->compiler_options.defines) {
+            cb(name, value);
+        }
+        // Exactly what QuasarDataMovementKernel::process_defines adds (kernel.cpp): the TU does
+        // not compile without them, and the probe must mirror the real build.
+        cb("NOC_INDEX", std::to_string(NOC::NOC_0));
+        cb("NOC_MODE", std::to_string(NOC_MODE::DM_DEDICATED_NOC));
+    }
+    void process_compile_time_args(std::function<void(const std::vector<uint32_t>&)> cb) const override {
+        // The real unified positional buffer: [ user CTA varargs | TensorBinding payloads ].
+        std::vector<uint32_t> compile_args = spec->advanced_options.compile_time_varargs;
+        compile_args.insert(compile_args.end(), tensor_bindings.cta_words.begin(), tensor_bindings.cta_words.end());
+        cb(compile_args);
+    }
+    uint32_t get_compile_time_vararg_count() const override {
+        // Baked into the generated args header (get_num_compile_time_varargs); the check TU
+        // must see the same count the real kernel build bakes.
+        return static_cast<uint32_t>(spec->advanced_options.compile_time_varargs.size());
+    }
+    void process_named_compile_time_args(
+        std::function<void(const std::unordered_map<std::string, uint32_t>&)> cb) const override {
+        cb(named_ctas);
+    }
+    void process_include_paths(const std::function<void(const std::string&)>& cb) const override {
+        for (const auto& p : include_paths) {
+            cb(p);
+        }
+    }
+    void process_dataflow_buffer_binding_handles(std::function<void(const std::string&, uint16_t)> cb) const override {
+        for (const auto& b : spec->dfb_bindings) {
+            const auto it = dfb_slots->find(b.dfb_spec_name);
+            cb(b.accessor_name, it != dfb_slots->end() ? static_cast<uint16_t>(it->second) : uint16_t{0});
+        }
+    }
+    void process_semaphore_binding_handles(
+        std::function<void(const std::string&, uint16_t, SemScope, uint32_t)> cb) const override {
+        for (const auto& b : spec->semaphore_bindings) {
+            cb(b.accessor_name, static_cast<uint16_t>(sem_ids->at(b.semaphore_spec_name)), SemScope::EXTERNAL, 1u);
+        }
+    }
+    void process_tensor_binding_handles(
+        std::function<void(const std::string&, uint32_t, uint32_t, uint32_t)> cb) const override {
+        for (const auto& h : tensor_bindings.handles) {
+            cb(h.accessor_name, h.cta_offset, h.addr_crta_offset, h.num_runtime_field_crta_words);
+        }
+    }
+    void process_scratchpad_binding_handles(
+        std::function<void(const std::string&, uint32_t, uint32_t)> cb) const override {
+        for (const auto& b : spec->scratchpad_bindings) {
+            cb(b.accessor_name, sizeof(uint32_t), 0u);
+        }
+    }
+    const std::vector<std::string>& get_runtime_arg_names() const override { return rta_names; }
+    const std::vector<std::string>& get_common_runtime_arg_names() const override { return crta_names; }
+    KernelCrtaLayout get_crta_layout() const override { return tensor_bindings.crta_layout; }
+};
+
+// One probe outcome per kernel: per-accessor op sets, or fully conservative.
+struct SemProbeOutcome {
+    bool conservative = false;
+    std::string reason;  // first conservative trigger, for the probe.result record
+    std::unordered_map<std::string, std::set<std::string>> accessor_ops;
+};
+
+// Resolve a compiler-reported path (diagnostic location or .d dependency) to canonical absolute
+// form: the probe compile runs with cwd = its target dir, so relative paths resolve there.
+std::string ResolveProbePath(const std::filesystem::path& target_dir, const std::string& p) {
+    std::error_code ec;
+    const std::filesystem::path fp(p);
+    const auto abs = fp.is_absolute() ? std::filesystem::weakly_canonical(fp, ec)
+                                      : std::filesystem::weakly_canonical(target_dir / fp, ec);
+    return ec ? p : abs.string();
+}
+
+bool PathHasTrustedPrefix(const std::string& path, const std::vector<std::string>& trusted) {
+    for (const auto& t : trusted) {
+        if (path.rfind(t, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Parse the probe compile log: every relevant diagnostic carries TT_SEM_USE:<op>, and tagged
+// ones name their semaphore as sem::<accessor>_t. Diagnostics located inside trusted headers
+// are the poisoned symbols' own internal uses (e.g. the probe-split 4-arg up() forwarding to
+// the 5-arg form) and are dropped; anything at an untrusted location that cannot be attributed
+// to a tag flips the whole kernel conservative.
+SemProbeOutcome ParseSemProbeLog(
+    const std::string& log_path, const std::filesystem::path& target_dir, const std::vector<std::string>& trusted) {
+    SemProbeOutcome out;
+    std::ifstream log(log_path);
+    if (!log) {
+        out.conservative = true;
+        out.reason = "no-log";
+        return out;
+    }
+    const std::regex op_re("TT_SEM_USE:([A-Za-z_]+)");
+    const std::regex tag_re("sem::([A-Za-z_][A-Za-z0-9_]*)_t");
+    std::string line;
+    while (std::getline(log, line)) {
+        const std::string location = ResolveProbePath(target_dir, line.substr(0, line.find(':')));
+        const bool trusted_loc = PathHasTrustedPrefix(location, trusted);
+        // A kernel-defined template over semaphores can make the compiler DEDUPLICATE
+        // per-location diagnostics across instantiations, silently swallowing a second tag's
+        // ops -- so a kernel-located instantiation context on the poisoned surface is
+        // unattributable.
+        if (!trusted_loc && line.find("In instantiation of") != std::string::npos &&
+            (line.find("Semaphore<") != std::string::npos || line.find("sem::") != std::string::npos ||
+             line.find("SemScope") != std::string::npos)) {
+            out.conservative = true;
+            if (out.reason.empty()) {
+                out.reason = "instantiation-context: " + line.substr(0, 160);
             }
             continue;
         }
-        if (in_block) {
-            if (c == '*' && i + 1 < text.size() && text[i + 1] == '/') {
-                in_block = false;
-                i++;
-            } else if (c == '\n') {
-                out += '\n';
+        if (line.find(": warning:") == std::string::npos) {
+            continue;  // caret/source-echo lines quote the attribute text itself: not diagnostics
+        }
+        static const std::regex echo_re("^\\s*[0-9]+\\s*\\|");
+        if (std::regex_search(line, echo_re)) {
+            continue;  // source-echo line: kernel text could spoof a diagnostic inside a string
+        }
+        std::smatch op_m;
+        if (!std::regex_search(line, op_m, op_re)) {
+            continue;
+        }
+        if (trusted_loc) {
+            continue;
+        }
+        const std::string op = op_m[1].str();
+        if (op == "raw") {
+            out.conservative = true;  // raw ring-address take in kernel code: unprovable
+            if (out.reason.empty()) {
+                out.reason = "raw: " + line.substr(0, 160);
             }
             continue;
         }
-        if (in_str || in_chr) {
-            if (c == '\\') {
-                i++;
-            } else if (c == (in_str ? '"' : '\'')) {
-                in_str = in_chr = false;
-            } else if (c == '\n') {
-                in_str = in_chr = false;
-                out += '\n';
+        std::smatch tag_m;
+        if (!std::regex_search(line, tag_m, tag_re)) {
+            out.conservative = true;  // an op with no semaphore attribution (raw or runtime id)
+            if (out.reason.empty()) {
+                out.reason = "untagged: " + line.substr(0, 160);
             }
             continue;
         }
-        if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
-            in_line = true;
-            continue;
-        }
-        if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
-            in_block = true;
-            i++;
-            continue;
-        }
-        if (c == '"') {
-            in_str = true;
-            continue;
-        }
-        // Char-literal entry. The alnum look-back skips digit separators (1'000, 0xAB'CD), but an
-        // ENCODING PREFIX (L'x', u'x', U'x', u8'x') is alnum too and its literal may contain a '"'
-        // that would spuriously open string mode and swallow the rest of the line -- the unsafe
-        // direction. Recognize a standalone prefix (not part of a longer identifier) explicitly.
-        const auto is_encoding_prefix = [&]() {
-            const size_t n = out.size();
-            if (n >= 1 && (out[n - 1] == 'L' || out[n - 1] == 'u' || out[n - 1] == 'U') &&
-                (n == 1 || (!std::isalnum(static_cast<unsigned char>(out[n - 2])) && out[n - 2] != '_'))) {
-                return true;
-            }
-            if (n >= 2 && out[n - 1] == '8' && out[n - 2] == 'u' &&
-                (n == 2 || (!std::isalnum(static_cast<unsigned char>(out[n - 3])) && out[n - 3] != '_'))) {
-                return true;
-            }
-            return false;
-        };
-        if (c == '\'' &&
-            (out.empty() || !std::isalnum(static_cast<unsigned char>(out.back())) || is_encoding_prefix())) {
-            in_chr = true;
-            continue;
-        }
-        out += c;
+        out.accessor_ops[tag_m[1].str()].insert(op);
     }
     return out;
 }
 
-// `resolved_dir` (optional out): the directory of the file actually read, for the quoted-include
-// shadow check in KernelIncludesAreScannable; left empty for inline SourceCode kernels.
-std::optional<std::string> ReadKernelSourceText(
-    const KernelSpec& kernel_spec, std::filesystem::path* resolved_dir = nullptr) {
-    return std::visit(
-        [resolved_dir](const auto& src) -> std::optional<std::string> {
-            using T = std::decay_t<decltype(src)>;
-            if constexpr (std::is_same_v<T, KernelSpec::SourceCode>) {
-                return src.code;
-            } else {
-                // Mirror the JIT's resolve_path order EXACTLY (impl/kernels/kernel.cpp): the scan
-                // must read the same file the compiler will, or a stale copy on a different
-                // search path could be scanned instead of the code that runs.
-                const auto& rtoptions = MetalContext::instance().rtoptions();
-                std::vector<std::filesystem::path> candidates;
-                if (src.is_absolute()) {
-                    candidates.push_back(src);
-                } else {
-                    candidates.push_back(std::filesystem::current_path() / src);
-                    if (rtoptions.is_kernel_dir_specified()) {
-                        candidates.push_back(std::filesystem::path(rtoptions.get_kernel_dir()) / src);
-                    }
-                    candidates.push_back(std::filesystem::path(rtoptions.get_system_kernel_dir()) / src);
-                    candidates.push_back(std::filesystem::path(rtoptions.get_root_dir()) / src);
-                }
-                for (const auto& p : candidates) {
-                    if (!std::filesystem::exists(p)) {
-                        continue;
-                    }
-                    std::ifstream f(p);
-                    if (!f) {
-                        return std::nullopt;
-                    }
-                    if (resolved_dir != nullptr) {
-                        *resolved_dir = p.parent_path();
-                    }
-                    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-                }
-                return std::nullopt;
-            }
-        },
-        kernel_spec.source);
-}
-
-bool IsIdentChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
-
-// Classify what `kernel` can do to the semaphore bound as `accessor`. See the banner above.
-SemAccessClass ScanSemaphoreAccess(const std::string& stripped, const std::string& accessor) {
-    // (Includes are allowlisted separately on the RAW text: KernelIncludesAreScannable.)
-    const std::string token = "sem::" + accessor;
-    // Collect variables constructed from this accessor; any other appearance of the token
-    // (aliasing, arithmetic, passing) is unprovable.
-    std::vector<std::string> vars;
-    size_t consumed = 0, total = 0;
-    for (size_t pos = stripped.find(token); pos != std::string::npos; pos = stripped.find(token, pos + 1)) {
-        if (pos > 0 && IsIdentChar(stripped[pos - 1])) {
-            continue;  // suffix of a longer name
-        }
-        const size_t after = pos + token.size();
-        if (after < stripped.size() && IsIdentChar(stripped[after])) {
-            continue;  // prefix of a longer name (different accessor)
-        }
-        total++;
-        // Allowed context 1: sem_scope_of(sem::acc)
-        size_t b = pos;
-        while (b > 0 && std::isspace(static_cast<unsigned char>(stripped[b - 1]))) {
-            b--;
-        }
-        if (b > 0 && stripped[b - 1] == '(') {
-            size_t e = b - 1;
-            while (e > 0 && std::isspace(static_cast<unsigned char>(stripped[e - 1]))) {
-                e--;
-            }
-            size_t id_end = e, id_beg = e;
-            while (id_beg > 0 && IsIdentChar(stripped[id_beg - 1])) {
-                id_beg--;
-            }
-            const std::string callee = stripped.substr(id_beg, id_end - id_beg);
-            if (callee == "sem_scope_of") {
-                consumed++;
-                continue;
-            }
-            // Allowed context 2: Semaphore [<...>] var (sem::acc)   (also {} form)
-            // callee is then the VARIABLE name; check what precedes it.
-            size_t t = id_beg;
-            while (t > 0 && std::isspace(static_cast<unsigned char>(stripped[t - 1]))) {
-                t--;
-            }
-            if (t > 0 && stripped[t - 1] == '>') {  // skip a template argument list
-                int depth = 1;
-                t--;
-                while (t > 0 && depth > 0) {
-                    t--;
-                    if (stripped[t] == '>') {
-                        depth++;
-                    } else if (stripped[t] == '<') {
-                        depth--;
-                    }
-                }
-                while (t > 0 && std::isspace(static_cast<unsigned char>(stripped[t - 1]))) {
-                    t--;
-                }
-            }
-            size_t ty_end = t, ty_beg = t;
-            while (ty_beg > 0 && IsIdentChar(stripped[ty_beg - 1])) {
-                ty_beg--;
-            }
-            if (stripped.substr(ty_beg, ty_end - ty_beg) == "Semaphore" && !callee.empty()) {
-                vars.push_back(callee);
-                consumed++;
-                continue;
-            }
-        }
-    }
-    if (consumed != total) {
-        return SemAccessClass::WRITER;  // aliased/escaped/odd usage: unprovable
-    }
-    // Catch spellings the sem:: token search cannot see (whitespace-qualified `sem :: name`,
-    // macro-pasted names): any bare word-bounded occurrence of the accessor identifier that is
-    // NOT a recognized construction variable makes the binding unprovable. When the variable
-    // shares the accessor's name (the universal pattern), the variable walk below covers every
-    // occurrence instead.
-    if (std::find(vars.begin(), vars.end(), accessor) == vars.end()) {
-        for (size_t pos = stripped.find(accessor); pos != std::string::npos; pos = stripped.find(accessor, pos + 1)) {
-            if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
-                (pos + accessor.size() < stripped.size() && IsIdentChar(stripped[pos + accessor.size()]))) {
-                continue;
-            }
-            if (pos >= 5 && stripped.compare(pos - 5, 5, "sem::") == 0) {
-                continue;  // part of a consumed sem::<name> token
-            }
-            return SemAccessClass::WRITER;
-        }
-    }
-    if (total == 0) {
-        return SemAccessClass::READ_ONLY;  // binds but never touches it: harmless
-    }
-    // Classify every use of every bound variable.
-    bool any_remote_up = false, any_read = false, any_local_write = false;
-    for (const auto& var : vars) {
-        for (size_t pos = stripped.find(var); pos != std::string::npos; pos = stripped.find(var, pos + 1)) {
-            if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
-                (pos + var.size() < stripped.size() && IsIdentChar(stripped[pos + var.size()]))) {
-                continue;  // substring of another identifier
-            }
-            if (pos >= 5 && stripped.compare(pos - 5, 5, "sem::") == 0) {
-                continue;  // the accessor token inside sem::<name> (validated separately above)
-            }
-            if (pos > 0 && stripped[pos - 1] == ':') {
-                return SemAccessClass::WRITER;  // any OTHER qualified use is unprovable
-            }
-            size_t p = pos + var.size();
-            while (p < stripped.size() && std::isspace(static_cast<unsigned char>(stripped[p]))) {
-                p++;
-            }
-            // The declaration itself: `var (sem::...` or `var {sem::...`
-            if (p < stripped.size() && (stripped[p] == '(' || stripped[p] == '{')) {
-                continue;
-            }
-            if (p >= stripped.size() || stripped[p] != '.') {
-                return SemAccessClass::WRITER;  // escape: &var, var passed, assigned, etc.
-            }
-            p++;
-            size_t m_beg = p;
-            while (p < stripped.size() && IsIdentChar(stripped[p])) {
-                p++;
-            }
-            const std::string method = stripped.substr(m_beg, p - m_beg);
-            while (p < stripped.size() && std::isspace(static_cast<unsigned char>(stripped[p]))) {
-                p++;
-            }
-            if (p >= stripped.size() || stripped[p] != '(') {
-                return SemAccessClass::WRITER;  // method pointer / odd use
-            }
-            if (method == "value" || method == "wait" || method == "wait_min") {
-                any_read = true;
-                continue;
-            }
-            if (method == "up") {
-                // Count top-level commas: the remote overload has >= 4 arguments.
-                int depth = 1, commas = 0;
-                size_t q = p + 1;
-                while (q < stripped.size() && depth > 0) {
-                    const char c = stripped[q];
-                    if (c == '(') {
-                        depth++;
-                    } else if (c == ')') {
-                        depth--;
-                    } else if (c == ',' && depth == 1) {
-                        commas++;
-                    }
-                    q++;
-                }
-                if (commas == 3) {  // exactly up(noc, x, y, v): the pinned-channel remote form
-                    any_remote_up = true;
-                    continue;
-                }
-                if (commas > 3) {
-                    return SemAccessClass::WRITER;  // explicit-vc remote up: channel not pinned
-                }
-                any_local_write = true;  // plain-local up()
-                continue;
-            }
-            if (method == "down" || method == "set") {
-                any_local_write = true;  // plain-local single-arg mutators
-                continue;
-            }
-            return SemAccessClass::WRITER;  // relay/multicast/anything else: unprovable
+// Fold one accessor's op set into the class the refinement consumes.
+SemAccessClass FoldSemProbeOps(const std::set<std::string>& ops) {
+    bool any_read = false, any_local_write = false, any_remote_up = false;
+    for (const auto& op : ops) {
+        if (op == "bind") {
+            continue;  // construction / sem_scope_of: not an access
+        } else if (op == "value" || op == "wait" || op == "wait_min") {
+            any_read = true;
+        } else if (op == "up_local" || op == "down" || op == "set") {
+            any_local_write = true;
+        } else if (op == "up_remote") {
+            any_remote_up = true;
+        } else {
+            return SemAccessClass::WRITER;  // up_remote_vc / mcast / relay / unknown
         }
     }
     if (any_remote_up) {
         // Remote-up mixed with ANYTHING else (reads or local writes) is unprovable: the remote
-        // form is an asynchronous NoC atomic that must never share a word with plain RMWs.
+        // form must never share a word with plain RMWs.
         return (!any_read && !any_local_write) ? SemAccessClass::REMOTE_UP_ONLY : SemAccessClass::WRITER;
     }
     if (any_local_write) {
@@ -566,205 +526,325 @@ SemAccessClass ScanSemaphoreAccess(const std::string& stripped, const std::strin
     return SemAccessClass::READ_ONLY;
 }
 
-// REMOTE_POSTED keeps the running count in the kernel's Semaphore OBJECT, so the bake is only
-// sound if the object is constructed exactly once per launch -- a construction inside a loop
-// (or a helper called twice) would restart the count and strand the receiver. Textual proof on
-// the stripped source: exactly one construction site, and it sits in STRAIGHT-LINE code at the
-// top of kernel_main() -- after kernel_main's opening brace with no intervening brace or
-// control-flow keyword, so it cannot be inside a loop, branch, lambda, or earlier helper.
-// Anything not provable returns false (the semaphore just stays EXTERNAL).
-bool ProvesSingleTopLevelConstruction(const std::string& stripped, const std::string& accessor) {
-    const std::string token = "sem::" + accessor;
-    size_t construction_pos = std::string::npos;
-    for (size_t pos = stripped.find(token); pos != std::string::npos; pos = stripped.find(token, pos + 1)) {
-        if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
-            (pos + token.size() < stripped.size() && IsIdentChar(stripped[pos + token.size()]))) {
-            continue;  // substring of a longer name (the scan validated these already)
-        }
-        // A construction site is `var (sem::acc` / `var {sem::acc`; the only other occurrence
-        // form the scan admits is sem_scope_of(sem::acc), which is not a construction.
-        size_t b = pos;
-        while (b > 0 && std::isspace(static_cast<unsigned char>(stripped[b - 1]))) {
-            b--;
-        }
-        if (b == 0 || (stripped[b - 1] != '(' && stripped[b - 1] != '{')) {
-            continue;
-        }
-        size_t e = b - 1;
-        while (e > 0 && std::isspace(static_cast<unsigned char>(stripped[e - 1]))) {
-            e--;
-        }
-        size_t id_beg = e;
-        while (id_beg > 0 && IsIdentChar(stripped[id_beg - 1])) {
-            id_beg--;
-        }
-        if (stripped.substr(id_beg, e - id_beg) == "sem_scope_of") {
-            continue;
-        }
-        if (construction_pos != std::string::npos) {
-            return false;  // second construction site
-        }
-        construction_pos = pos;
+// The one narrow suppression backstop: '#pragma GCC diagnostic ignored' (or _Pragma) in an
+// UNTRUSTED file of the probe's include closure silences the poison and no compiler flag
+// overrides it, so its presence makes the kernel unprovable. Trusted repo/toolchain headers
+// legitimately use diagnostic pragmas and are exempt.
+bool ProbeClosureSuppressesDiagnostics(
+    const std::string& dep_path, const std::filesystem::path& target_dir, const std::vector<std::string>& trusted) {
+    std::ifstream dep(dep_path);
+    if (!dep) {
+        return true;  // no dependency listing: cannot vouch for the closure
     }
-    if (construction_pos == std::string::npos) {
-        return false;
-    }
-    // Anchor on the kernel_main() DEFINITION -- and only if it is unambiguous: exactly one
-    // word-bounded occurrence in the whole text (a forward declaration, a recursive call, or any
-    // expression reference makes the anchor -- and re-entry -- unprovable), preceded by `void`.
-    size_t main_pos = std::string::npos;
-    const std::string kmain = "kernel_main";
-    for (size_t pos = stripped.find(kmain); pos != std::string::npos; pos = stripped.find(kmain, pos + 1)) {
-        if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
-            (pos + kmain.size() < stripped.size() && IsIdentChar(stripped[pos + kmain.size()]))) {
-            continue;
-        }
-        if (main_pos != std::string::npos) {
-            return false;  // second occurrence: declaration/call/recursion -- not provable
-        }
-        main_pos = pos;
-    }
-    if (main_pos == std::string::npos || main_pos > construction_pos) {
-        return false;  // constructed before kernel_main: a helper or a global -- not provable
-    }
-    size_t rt = main_pos;
-    while (rt > 0 && std::isspace(static_cast<unsigned char>(stripped[rt - 1]))) {
-        rt--;
-    }
-    size_t rt_beg = rt;
-    while (rt_beg > 0 && IsIdentChar(stripped[rt_beg - 1])) {
-        rt_beg--;
-    }
-    if (stripped.substr(rt_beg, rt - rt_beg) != "void") {
-        return false;  // not the plain definition spelling: unprovable
-    }
-    const size_t body_open = stripped.find('{', main_pos);
-    if (body_open == std::string::npos || body_open > construction_pos) {
-        return false;
-    }
-    // Straight-line check: no brace, no label, and no control-flow keyword between the opening
-    // brace and the construction. (`if` and `switch` matter too: a conditionally-skipped
-    // construction leaves later calls on a dead object only in ill-formed code, but pessimism is
-    // free. A single `:` rejects LABELS -- a later backward `goto` would re-run the construction
-    // from outside this scanned region -- at the cost of also rejecting ternaries here.)
-    static const std::string kControl[] = {"for", "while", "do", "if", "switch", "goto"};
-    for (size_t p = body_open + 1; p < construction_pos; p++) {
-        const char c = stripped[p];
-        if (c == '{' || c == '}') {
-            return false;
-        }
-        if (c == ':') {
-            if (p + 1 < stripped.size() && stripped[p + 1] == ':') {
-                p++;  // `::` qualification (args::x, sem::x): fine
+    const auto deps = jit_build::parse_dependency_file(dep);
+    for (const auto& [obj, files] : deps) {
+        for (const auto& raw : files) {
+            const std::string f = ResolveProbePath(target_dir, raw);
+            if (PathHasTrustedPrefix(f, trusted)) {
                 continue;
             }
-            return false;  // a label (or ternary): jump target ahead of the construction
-        }
-        if (!IsIdentChar(c) || (p > 0 && IsIdentChar(stripped[p - 1]))) {
-            continue;  // only inspect identifier starts
-        }
-        size_t q = p;
-        while (q < construction_pos && IsIdentChar(stripped[q])) {
-            q++;
-        }
-        const std::string word = stripped.substr(p, q - p);
-        if (std::find(std::begin(kControl), std::end(kControl), word) != std::end(kControl)) {
-            return false;
+            std::ifstream in(f);
+            if (!in) {
+                return true;
+            }
+            const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            // Any of these in an external file can make the probe see different code than the
+            // real build (or silence the poison): whitespace-tolerant diagnostic pragmas,
+            // _Pragma operators, conditioning on the probe define itself, or per-processor
+            // arms (the probe compiles ONE canonical DM variant).
+            static const std::regex suppress_re("(#|%:)\\s*pragma\\s+GCC\\s+diagnostic");
+            if (std::regex_search(text, suppress_re) || text.find("_Pragma") != std::string::npos ||
+                text.find("TT_SEM_USAGE_PROBE") != std::string::npos ||
+                text.find("COMPILE_FOR_DM") != std::string::npos ||
+                text.find("TT_METAL2_SEM_SCOPE_TABLE") != std::string::npos ||
+                text.find("FULL_KERNEL_NAME") != std::string::npos) {
+                return true;
+            }
         }
     }
-    return true;
+    return false;
 }
 
-// Source-level scannability gate, checked on the RAW text (the stripper erases string
-// contents, so include targets and directives must be inspected before stripping). Anything
-// this cannot fully account for makes the whole kernel unscannable (=> every binding WRITER):
-//  - every '#' directive containing 'include' is parsed properly (any spacing, #include_next,
-//    macro-computed includes): quoted targets must live under api/ or experimental/, contain
-//    no ".." traversal, and not be shadowed by a same-named file next to the kernel (quoted
-//    includes search the kernel's own directory first); angle targets must be plain slash-free
-//    system headers (<cstdint>); anything else fails.
-//  - '#define' anywhere: a macro could rename a method or hide a call.
-//  - a comment token straight after '#': it hides the directive from this raw-text parse.
-//  - raw string literals (R") and backslash-newline splices: they defeat the simple lexer.
-// A '#include' inside a comment fails too -- pessimism is free, unsoundness is not.
-// (User -D defines and -I include paths are gated separately at the call site: both can make
-// the compiler see code this scan cannot.)
-bool KernelIncludesAreScannable(const std::string& raw, const std::filesystem::path& kernel_dir) {
-    if (raw.find("R\"") != std::string::npos || raw.find("\\\n") != std::string::npos ||
-        raw.find("\\\r") != std::string::npos) {
-        return false;
+// Run (or reuse) the usage probe for one kernel: emit the probe genfiles, compile the real
+// kernel TU frontend-only with the poisoned surface, parse the diagnostics into per-accessor
+// classes. Returns nullopt when the kernel is fully conservative (compile failure included).
+// Outcomes cache on the probe's own dependency-closure hash + command stamp, so a program
+// rebuild with unchanged sources costs no compiler invocation.
+std::optional<std::unordered_map<std::string, SemAccessClass>> RunSemUsageProbe(
+    distributed::MeshDevice& mesh_device,
+    const KernelSpec& kernel_spec,
+    const DFBNameToSlotMap& dfb_name_to_slot,
+    const SemaphoreNameToIdMap& semaphore_name_to_id,
+    const std::unordered_map<TensorParamName, ResolvedTensorParameter>& resolved_tensor_parameters) {
+    // Inline SourceCode kernels are textually pasted into the (trusted) generated
+    // kernel_includes.hpp, so their diagnostics cannot be distinguished from generated code:
+    // no probe, conservative (they simply keep EXTERNAL).
+    if (std::holds_alternative<KernelSpec::SourceCode>(kernel_spec.source)) {
+        return std::nullopt;
     }
-    // Digraphs are valid C++ alternative tokens the lexical scans below cannot see: `%:` is '#'
-    // (a hidden directive), `<%`/`%>` are '{'/'}' (a hidden brace defeats the construction
-    // prover's straight-line check), `<:`/`:>` are '['/']'. All-or-nothing rejection; no in-tree
-    // kernel uses any (the `<::` template spelling would false-hit `<:`, and that is fine --
-    // pessimism is free).
-    for (const char* digraph : {"%:", "<%", "%>", "<:", ":>"}) {
-        if (raw.find(digraph) != std::string::npos) {
-            return false;
-        }
+    // Compute kernels cannot legally bind semaphores; the FATAL lives in skippable validation,
+    // so re-check here rather than probing with the wrong (DM) build state.
+    if (!kernel_spec.is_data_movement_kernel()) {
+        return std::nullopt;
     }
-    for (size_t pos = raw.find('#'); pos != std::string::npos; pos = raw.find('#', pos + 1)) {
-        size_t p = pos + 1;
-        while (p < raw.size() && (raw[p] == ' ' || raw[p] == '\t')) {
-            p++;
-        }
-        // After the skippable blanks, only a directive name or an empty directive (newline/EOF)
-        // is scannable. Anything else -- a comment splice (`#/*c*/include`), form-feed or
-        // vertical-tab (both directive whitespace to the compiler, invisible to this parse),
-        // any control byte -- could hide a directive: unscannable.
-        if (p < raw.size() && raw[p] != '\n' && raw[p] != '\r' &&
-            !(std::isalnum(static_cast<unsigned char>(raw[p])) || raw[p] == '_')) {
-            return false;
-        }
-        size_t d_beg = p;
-        while (p < raw.size() && (std::isalnum(static_cast<unsigned char>(raw[p])) || raw[p] == '_')) {
-            p++;
-        }
-        const std::string directive = raw.substr(d_beg, p - d_beg);
-        if (directive == "define") {
-            return false;
-        }
-        if (directive.rfind("include", 0) != 0) {
-            continue;  // if/ifdef/endif/pragma/...: harmless to the scan (both arms are scanned)
-        }
-        while (p < raw.size() && (raw[p] == ' ' || raw[p] == '\t')) {
-            p++;
-        }
-        if (p >= raw.size()) {
-            return false;
-        }
-        if (raw[p] == '"') {
-            const size_t end = raw.find('"', p + 1);
-            if (end == std::string::npos) {
-                return false;
+    // Probe identity: everything that can change what the compiler sees.
+    std::ostringstream ident;
+    std::visit(
+        [&](const auto& s) {
+            using T = std::decay_t<decltype(s)>;
+            if constexpr (std::is_same_v<T, KernelSpec::SourceCode>) {
+                ident << "code:" << s.code;
+            } else {
+                ident << "path:" << s.string();
             }
-            const std::string inc = raw.substr(p + 1, end - p - 1);
-            if (inc.rfind("api/", 0) != 0 && inc.rfind("experimental/", 0) != 0) {
-                return false;  // a local helper could hide an access we cannot see
+        },
+        kernel_spec.source);
+    for (const auto& b : kernel_spec.semaphore_bindings) {
+        ident << ";s=" << b.accessor_name << ":" << semaphore_name_to_id.at(b.semaphore_spec_name);
+    }
+    for (const auto& b : kernel_spec.dfb_bindings) {
+        const auto it = dfb_name_to_slot.find(b.dfb_spec_name);
+        ident << ";d=" << b.accessor_name << ":" << (it != dfb_name_to_slot.end() ? it->second : 0u);
+    }
+    const TensorBindingsForKernel ta_bindings = ResolveTensorBindingsForKernel(
+        kernel_spec,
+        resolved_tensor_parameters,
+        /*base_named_crta_count=*/kernel_spec.runtime_arg_schema.common_runtime_arg_names.size(),
+        /*base_cta_offset=*/static_cast<uint32_t>(kernel_spec.advanced_options.compile_time_varargs.size()));
+    for (const auto& h : ta_bindings.handles) {
+        ident << ";t=" << h.accessor_name << ":" << h.cta_offset << ":" << h.addr_crta_offset << ":"
+              << h.num_runtime_field_crta_words;
+    }
+    for (const auto& w : ta_bindings.cta_words) {
+        ident << ";w=" << w;
+    }
+    for (const auto& b : kernel_spec.scratchpad_bindings) {
+        ident << ";p=" << b.accessor_name;
+    }
+    for (const auto& [name, value] : kernel_spec.compiler_options.defines) {
+        ident << ";D" << name << "=" << value;
+    }
+    for (const auto& p : kernel_spec.compiler_options.include_paths) {
+        ident << ";I" << p.string();
+    }
+    for (const auto& n : kernel_spec.runtime_arg_schema.runtime_arg_names) {
+        ident << ";r=" << n;
+    }
+    for (const auto& n : kernel_spec.runtime_arg_schema.common_runtime_arg_names) {
+        ident << ";c=" << n;
+    }
+    std::ostringstream probe_name;
+    probe_name << "semprobe_" << std::hex << std::hash<std::string>{}(ident.str());
+
+    const ContextId ctx = extract_context_id(&mesh_device);
+    auto& bem = BuildEnvManager::get_instance(ctx);
+    const JitBuildEnv& env = bem.get_device_build_env(mesh_device.build_id()).build_env;
+    const uint32_t core_idx =
+        MetalContext::instance().hal().get_programmable_core_type_index(HalProgrammableCoreType::TENSIX);
+    const JitBuildState& bs = bem.get_kernel_build_state(
+        mesh_device.build_id(), core_idx, static_cast<uint32_t>(HalProcessorClassType::DM), /*processor_id=*/2);
+
+    const std::string root = env.get_root_path();
+    const auto canonicalize = [](std::vector<std::string> prefixes) {
+        for (auto& t : prefixes) {  // compare canonical-to-canonical (roots may be symlinked)
+            std::error_code ec;
+            const auto canon = std::filesystem::weakly_canonical(std::filesystem::path(t), ec);
+            if (!ec) {
+                t = canon.string() + "/";
             }
-            if (inc.find("..") != std::string::npos) {
-                return false;  // "api/../x.h" escapes the trusted tree while keeping the prefix
-            }
-            // Quoted includes search the including file's own directory FIRST, so a file at
-            // <kernel_dir>/api/... would SHADOW the trusted repo header the prefix vouches for.
-            if (!kernel_dir.empty() && std::filesystem::exists(kernel_dir / inc)) {
-                return false;
-            }
-        } else if (raw[p] == '<') {
-            const size_t end = raw.find('>', p + 1);
-            if (end == std::string::npos) {
-                return false;
-            }
-            const std::string inc = raw.substr(p + 1, end - p - 1);
-            if (inc.find('/') != std::string::npos || inc.find('\\') != std::string::npos) {
-                return false;  // angle form can reach repo headers via -I; allow plain <cstdint>-style only
-            }
+        }
+        return prefixes;
+    };
+    // Two DIFFERENT trust sets. The parser filters diagnostics at locations where the poisoned
+    // symbols are legitimately used INTERNALLY (the device headers and our generated files) --
+    // it must stay tight, or kernel-side ops would be filtered away. The pragma gate exempts
+    // everything code-reviewed (the whole repo + toolchain + our generated files) and scans
+    // only genuinely external files, the actual suppression attack surface.
+    const std::vector<std::string> poison_internal =
+        canonicalize({root + "tt_metal/hw/", env.get_out_kernel_root_path()});
+    const std::vector<std::string> pragma_exempt =
+        canonicalize({root, "/opt/tenstorrent/sfpi/", env.get_out_kernel_root_path()});
+
+    SemProbeSettings ps;
+    ps.full_name = probe_name.str();
+    ps.spec = &kernel_spec;
+    ps.dfb_slots = &dfb_name_to_slot;
+    ps.sem_ids = &semaphore_name_to_id;
+    ps.rta_names.assign(
+        kernel_spec.runtime_arg_schema.runtime_arg_names.begin(),
+        kernel_spec.runtime_arg_schema.runtime_arg_names.end());
+    ps.crta_names.assign(
+        kernel_spec.runtime_arg_schema.common_runtime_arg_names.begin(),
+        kernel_spec.runtime_arg_schema.common_runtime_arg_names.end());
+    for (const auto& [name, value] : kernel_spec.compile_time_args) {
+        ps.named_ctas.emplace(name, value);
+    }
+    for (const auto& v : kernel_spec.advanced_options.compile_time_varargs) {
+        ident << ";v=" << v;
+    }
+    for (const auto& p : kernel_spec.compiler_options.include_paths) {
+        ps.include_paths.push_back(p.string());
+    }
+    ps.tensor_bindings = ta_bindings;
+
+    const std::string gen_dir = env.get_out_kernel_root_path() + ps.full_name + "/";
+    const std::string target_dir = gen_dir + "probe/";
+    std::filesystem::create_directories(target_dir);
+    // Concurrent builds may probe the same kernel (the cache root is shared, sometimes a
+    // network mount): compile artifacts are per-process, and the shared-name cache files are
+    // only ever REPLACED via atomic rename, so a reader always sees one writer's consistent
+    // (stamp, ops) pair -- never a torn or half-written record.
+    char probe_host[64] = {};
+    ::gethostname(probe_host, sizeof(probe_host) - 1);
+    const std::string uniq = std::string(probe_host) + "_" + std::to_string(static_cast<long>(::getpid())) + "_" +
+                             std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const std::string obj_path = target_dir + "probe_" + uniq + ".o";
+    const std::string dep_path = target_dir + "probe_" + uniq + ".d";
+    const std::string log_path = target_dir + "probe_" + uniq + ".log";
+    const std::string result_path = target_dir + "probe.result";
+    const std::string hash_path = target_dir + "probe.dephash";
+
+    const KernelSource kernel_src = MakeKernelSource(kernel_spec, ctx);
+    if (kernel_src.source_type_ == KernelSource::SourceType::FILE_PATH) {
+        // Mirror the real kernel build: the kernel's own directory is an include path (FIRST,
+        // like Kernel::process_include_paths), so its quoted local includes resolve identically
+        // (and land in the probed closure).
+        ps.include_paths.insert(
+            ps.include_paths.begin(), std::filesystem::path(kernel_src.path_).parent_path().string());
+    }
+
+    // Build the exact command up front: its stamp is part of the cache key.
+    tt::jit_build::TargetRecipe recipe = bs.export_target_recipe(&ps);
+    // Frontend only; -Wsystem-headers restores diagnostics a '#pragma GCC system_header' would
+    // hide; blanket -Wno-error because the probe never ships a binary -- stray warnings in
+    // system headers must not fail the compile (real errors still do).
+    const std::string cflags = recipe.cflags + " -fsyntax-only -Wsystem-headers -Wno-error";
+    std::vector<std::string> defines = recipe.defines;  // each element is a full "-DX=Y" token
+    defines.push_back("-DTT_SEM_USAGE_PROBE=1");
+    TT_FATAL(!recipe.srcs.empty(), "semaphore usage probe: target {} has no source", recipe.target_name);
+    const std::vector<std::string> argv = jit_build::utils::build_gpp_argv(
+        env.get_gpp(),
+        recipe.compiler_opt_level,
+        cflags,
+        recipe.includes,
+        defines,
+        recipe.srcs.front(),
+        jit_build::utils::GppAction::Compile,
+        obj_path,
+        dep_path);
+    std::ostringstream stamp_src;  // the compile inputs -- NOT argv, whose -o/-MF paths are per-process
+    stamp_src << env.get_gpp() << '|' << recipe.compiler_opt_level << '|' << cflags << '|' << recipe.includes << '|'
+              << recipe.srcs.front() << '|';
+    for (const auto& d : defines) {
+        stamp_src << d << ' ';
+    }
+    const std::string stamp = std::to_string(std::hash<std::string>{}(stamp_src.str()));
+
+    // Cached outcome: valid while the command and the probed include closure are unchanged.
+    const auto load_cached = [&]() -> std::optional<SemProbeOutcome> {
+        std::ifstream in(result_path);
+        if (!in) {
+            return std::nullopt;
+        }
+        std::string cached_stamp, status;
+        if (!std::getline(in, cached_stamp) || cached_stamp != stamp || !std::getline(in, status)) {
+            return std::nullopt;
+        }
+        SemProbeOutcome out;
+        out.conservative = (status.rfind("conservative", 0) == 0);
+        std::string accessor, op;
+        while (in >> accessor >> op) {
+            out.accessor_ops[accessor].insert(op);
+        }
+        return out;
+    };
+    std::optional<SemProbeOutcome> outcome;
+    if (jit_build::dependencies_up_to_date_file(hash_path)) {
+        outcome = load_cached();
+    }
+
+    if (!outcome.has_value()) {
+        jit_build_genfiles_kernel_include(env, ps, kernel_src);
+        std::filesystem::remove(log_path);  // exec_command appends: stale diagnostics must not fold in
+        const bool ok = jit_build::utils::exec_command(argv, target_dir, log_path);
+        SemProbeOutcome fresh;
+        if (!ok) {
+            fresh.conservative = true;  // does not compile as the real build would: unprovable
+            fresh.reason = "compile-failed";
         } else {
-            return false;  // macro-computed include target: unknowable
+            fresh = ParseSemProbeLog(log_path, target_dir, poison_internal);
+            if (!fresh.conservative && ProbeClosureSuppressesDiagnostics(dep_path, target_dir, pragma_exempt)) {
+                fresh.conservative = true;
+                fresh.reason = "pragma-closure";
+            }
         }
+        // A -D value can smuggle a suppressing pragma past the closure check.
+        for (const auto& [name, value] : kernel_spec.compiler_options.defines) {
+            if (value.find("Pragma") != std::string::npos || value.find("pragma") != std::string::npos) {
+                fresh.conservative = true;
+                fresh.reason = "pragma-define";
+            }
+        }
+        if (!fresh.conservative) {
+            // The kernel's OWN source is the adversarial surface even when it lives in-repo
+            // (repo HEADERS stay pragma-exempt: shared reviewed infra legitimately uses
+            // diagnostic pragmas and per-processor arms; a KERNEL doing so is unprovable).
+            std::ifstream kin(kernel_src.path_);
+            if (!kin) {
+                fresh.conservative = true;
+                fresh.reason = "kernel-unreadable";
+            } else {
+                const std::string ktext((std::istreambuf_iterator<char>(kin)), std::istreambuf_iterator<char>());
+                static const std::regex kernel_suppress_re("(#|%:)\\s*pragma\\s+GCC\\s+diagnostic");
+                if (std::regex_search(ktext, kernel_suppress_re) || ktext.find("_Pragma") != std::string::npos ||
+                    ktext.find("TT_SEM_USAGE_PROBE") != std::string::npos ||
+                    ktext.find("COMPILE_FOR_DM") != std::string::npos ||
+                    ktext.find("TT_METAL2_SEM_SCOPE_TABLE") != std::string::npos ||
+                    ktext.find("FULL_KERNEL_NAME") != std::string::npos) {
+                    fresh.conservative = true;
+                    fresh.reason = "kernel-conditioning";
+                }
+            }
+        }
+        if (ok) {  // only a successful compile leaves a dependency listing worth keying on
+            const std::string hash_tmp = hash_path + ".tmp" + uniq;
+            jit_build::write_dependency_hashes(target_dir, obj_path, hash_tmp);
+            const std::string result_tmp = result_path + ".tmp" + uniq;
+            {
+                std::ofstream out(result_tmp, std::ios::trunc);
+                out << stamp << "\n"
+                    << (fresh.conservative ? "conservative " + fresh.reason : std::string("ok")) << "\n";
+                if (!fresh.conservative) {  // never persist a partial op set alongside a bail-out
+                    for (const auto& [accessor, ops] : fresh.accessor_ops) {
+                        for (const auto& op : ops) {
+                            out << accessor << ' ' << op << '\n';
+                        }
+                    }
+                }
+            }
+            std::error_code ec;
+            std::filesystem::rename(result_tmp, result_path, ec);  // atomic: readers see old or new
+            std::filesystem::rename(hash_tmp, hash_path, ec);
+        }
+        {
+            std::error_code ec;  // always: failed probes re-run every build and must not accrete
+            std::filesystem::remove(obj_path, ec);
+            std::filesystem::remove(dep_path, ec);
+            std::filesystem::remove(log_path, ec);
+        }
+        outcome = std::move(fresh);
     }
-    return true;
+
+    if (outcome->conservative) {
+        return std::nullopt;
+    }
+    std::unordered_map<std::string, SemAccessClass> classes;
+    for (const auto& b : kernel_spec.semaphore_bindings) {
+        const auto it = outcome->accessor_ops.find(b.accessor_name);
+        classes[b.accessor_name] =
+            (it == outcome->accessor_ops.end()) ? SemAccessClass::READ_ONLY : FoldSemProbeOps(it->second);
+    }
+    return classes;
 }
 
 // Resolve the device SemScope baked into every kernel that binds this semaphore: the cheapest
@@ -777,9 +857,9 @@ bool KernelIncludesAreScannable(const std::string& raw, const std::filesystem::p
 //   Gen2, single-node sem, all binders   -> DM_LOCAL_CACHED (node-local AMO; any number of
 //         DM kernels confined to it         binder kernels/threads)
 //   anything else (off-node reach)       -> EXTERNAL (self-targeted NoC atomic)
-// An EXTERNAL result is not necessarily final: the source access-scan refinement downstream
-// (see the gap-3/gap-8 arms in BuildProgramFromSpec) may downgrade it to LOCAL_NONATOMIC /
-// REMOTE_POSTED when it can PROVE the writes cannot race.
+// An EXTERNAL result is not necessarily final: the usage-probe refinement downstream (see
+// the gap-3/gap-8 arms in BuildProgramFromSpec) may downgrade it to LOCAL_NONATOMIC /
+// REMOTE_POSTED when the compiler frontend can PROVE the writes cannot race.
 SemScope ResolveSemaphoreScope(const SemaphoreSpec& sem, const CollectedSpecData::SemaphoreBinderInfo& binders) {
     // Gen1 keeps the uncached RMW every semaphore has always used there; the atomic tiers are
     // Quasar hardware paths, so no existing Gen1 program changes mechanism.
@@ -2865,21 +2945,6 @@ KernelRiscMaskMap BuildGen1KernelRiscMasks(const ProgramSpec& spec) {
 // field that lives in CRTAs: either sharded + dynamic_tensor_shape (which puts
 // `rank` shape words in CRTAs), or interleaved row-major + dynamic_tensor_shape (one
 // page-size word). The two are mutually exclusive per binding -- see runtime_field_is_page_size.
-struct ResolvedTensorParameter {
-    std::vector<uint32_t> cta_payload;
-
-    // How many CRTA words (beyond the base address) does this binding consume?
-    // This is only used if TensorParameter relaxations have been requested.
-    uint32_t extra_crta_words = 0;
-
-    // What info the runtime field CRTA words actually contain depends on the relaxation.
-    // Currently, there are only two mutually exclusive possibilities (though more may be added):
-    //  1. The interleaved row-major page-size (one CRTA only)
-    //  2. The sharded dynamic_tensor_shape shape (one CRTA per tensor dim)
-    // For now, since there are only two mutually exclusive possibilities, it's sufficient to
-    // distinguish them with a boolean.
-    bool runtime_field_is_page_size = false;
-};
 
 // Resolve a TensorParameter's static layout into a CTA payload + an extra CRTA word
 // count for any runtime-resolved fields.
@@ -3034,13 +3099,6 @@ ResolvedTensorParameter ResolveTensorParameterStaticCTAs(
 //  - The full CRTA buffer layout (named CRTAs + binding section + vararg-section start),
 //    precomputed here so consumers (headergen, runtime) don't have to re-derive section
 //    boundaries by walking handles. See KernelCrtaLayout in jit_build_settings.hpp.
-struct TensorBindingsForKernel {
-    std::vector<TensorBindingHandle> handles;
-    // Binding-only CTA payload; appended after the user CTA-vararg positional prefix.
-    std::vector<uint32_t> cta_words;
-    KernelCrtaLayout crta_layout;
-};
-
 // Resolve the tensor bindings for a single kernel:
 //  1. Walk the kernel's tensor_bindings in declaration order
 //  2. Pack each binding's CTA payload into a contiguous positional buffer
@@ -3695,9 +3753,9 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
             ResolveSemaphoreScope(semaphore_spec, SemaphoreBinders(collected, semaphore_name));
     }
 
-    // Access-scan refinement of would-be-EXTERNAL semaphores ONLY (never touches LOCAL/CACHED
-    // picks). Two shapes escape the NoC-atomic tax when the conservative source scan can PROVE
-    // the access pattern (anything unprovable stays EXTERNAL -- see ScanSemaphoreAccess):
+    // Usage-probe refinement of would-be-EXTERNAL semaphores ONLY (never touches LOCAL/CACHED
+    // picks). Two shapes escape the NoC-atomic tax when the compiler-frontend probe can PROVE
+    // the access pattern (anything unprovable stays EXTERNAL -- see RunSemUsageProbe):
     //   gap 3: sole LOCAL_WRITER (1 instance) ON the sem's node, every other binder read-only
     //          -> everyone bakes LOCAL_NONATOMIC (the plain word is already NoC-readable).
     //   gap 8: sole REMOTE_UP_ONLY writer (1 instance) OFF the sem's node, every other binder
@@ -3708,26 +3766,18 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
     // Gen2 + non-emule only (emule keeps the Gen1 arms).
     std::unordered_map<SemaphoreSpecName, const KernelSpec*> sem_posted_writer;
     if (is_gen2_arch() && cached_tier_available()) {
-        std::unordered_map<const KernelSpec*, std::optional<std::string>> stripped_cache;
-        auto stripped_source = [&](const KernelSpec* k) -> const std::optional<std::string>& {
-            auto it = stripped_cache.find(k);
-            if (it == stripped_cache.end()) {
-                std::optional<std::string> text;
-                std::filesystem::path kernel_dir;
-                // User -D defines could rename identifiers the scan keys on, and user -I paths
-                // could satisfy an include with a header the allowlist cannot vouch for; don't
-                // try to see through either (both #if arms are scanned anyway, so options that
-                // only SELECT code are the ones we lose -- an acceptable pessimism).
-                if (k->compiler_options.defines.empty() && k->compiler_options.include_paths.empty()) {
-                    text = ReadKernelSourceText(*k, &kernel_dir);
-                }
-                if (text.has_value() && !KernelIncludesAreScannable(*text, kernel_dir)) {
-                    text.reset();  // unscannable source: treat every binding as writer
-                }
-                if (text.has_value()) {
-                    *text = StripCommentsForSemScan(*text);
-                }
-                it = stripped_cache.emplace(k, std::move(text)).first;
+        std::unordered_map<const KernelSpec*, std::optional<std::unordered_map<std::string, SemAccessClass>>>
+            probe_cache;
+        auto kernel_access_classes =
+            [&](const KernelSpec* k) -> const std::optional<std::unordered_map<std::string, SemAccessClass>>& {
+            auto it = probe_cache.find(k);
+            if (it == probe_cache.end()) {
+                it = probe_cache
+                         .emplace(
+                             k,
+                             RunSemUsageProbe(
+                                 mesh_device, *k, dfb_name_to_slot, semaphore_name_to_id, resolved_tensor_parameters))
+                         .first;
             }
             return it->second;
         };
@@ -3745,9 +3795,12 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
             SemAccessClass writer_class = SemAccessClass::WRITER;
             bool refinable = true;
             for (const auto& rec : binders.binders) {
-                const auto& text = stripped_source(rec.kernel);
-                const SemAccessClass cls =
-                    text.has_value() ? ScanSemaphoreAccess(*text, rec.binding->accessor_name) : SemAccessClass::WRITER;
+                const auto& classes = kernel_access_classes(rec.kernel);
+                SemAccessClass cls = SemAccessClass::WRITER;
+                if (classes.has_value()) {
+                    const auto found = classes->find(rec.binding->accessor_name);
+                    cls = (found != classes->end()) ? found->second : SemAccessClass::WRITER;
+                }
                 if (cls == SemAccessClass::READ_ONLY) {
                     continue;
                 }
@@ -3776,17 +3829,17 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
                 semaphore_name_to_scope[semaphore_name] = SemScope::LOCAL_NONATOMIC;
             } else if (
                 writer_off_node && writer_class == SemAccessClass::REMOTE_UP_ONLY &&
-                semaphore_spec.advanced_options.initial_value == 0 &&
-                ProvesSingleTopLevelConstruction(*stripped_source(writer->kernel), writer->binding->accessor_name)) {
+                semaphore_spec.advanced_options.initial_value == 0) {
                 // gap 8 -- with the audit-mandated guards: the staged running count is absolute,
-                // so init must be 0 (re-checked here, not just in skippable validation); the
-                // count lives in the writer's Semaphore OBJECT, so the source must prove exactly
-                // one straight-line construction (a loop/helper re-construction would restart
-                // it); and the writer kernel must not bind another semaphore sharing this table
-                // slot (per-binder scopes are invisible to the id-collision fixpoint; refuse up
-                // front). Sharing the per-hart staging slot with OTHER slot users (an EXTERNAL
-                // binding's returning atomics, a second REMOTE_POSTED sem) is safe: the device
-                // arm waits for each staged write to DEPART before returning.
+                // so init must be 0 (re-checked here, not just in skippable validation), and the
+                // writer kernel must not bind another semaphore sharing this table slot
+                // (per-binder scopes are invisible to the id-collision fixpoint; refuse up
+                // front). No construction-count proof is needed: the running count is
+                // kernel-image state (tt_sem_posted_count_, wrapper-zeroed per launch), so
+                // object re-construction is harmless. Sharing the per-hart staging slot with
+                // OTHER slot users (an EXTERNAL binding's returning atomics, a second
+                // REMOTE_POSTED sem) is safe: the device arm waits for each staged write to
+                // DEPART before returning.
                 const uint32_t this_id = semaphore_name_to_id.at(semaphore_name);
                 bool id_clash = false;
                 for (const auto& other_binding : writer->kernel->semaphore_bindings) {

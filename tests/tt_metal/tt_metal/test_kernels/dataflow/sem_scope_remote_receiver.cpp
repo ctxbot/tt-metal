@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Remote-up RECEIVER (on the semaphore's node): waits for the exact expected total, then
-// reports the scope-table entry and value(). Read-only by construction -- the census access
-// scan proves it, which is what lets a sole remote sender take the posted-write fast path.
+// reports the scope-table entry and value(). Read-only by construction -- the usage probe
+// proves it, which is what lets a sole remote sender take the posted-write fast path.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc_semaphore.h"

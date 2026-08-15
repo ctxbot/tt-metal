@@ -15,7 +15,7 @@
  *
  *  - LOCAL_NONATOMIC: L1 read-modify-write. Picked when nothing can race the word: at most one
  *      binder instance, or a census-proven sole writer whose other binders are all read-only
- *      (the access-scan refinements in program_spec.cpp; a REMOTE_POSTED writer's home-side
+ *      (the usage-probe refinements in program_spec.cpp; a REMOTE_POSTED writer's home-side
  *      binders also land here).
  *  - DM_LOCAL_CACHED: Touched only by DM threads on the semaphore's one node -- any number of
  *      binder kernels/threads (the node's DM harts are mutually coherent). Increments are a
@@ -40,16 +40,25 @@ enum class SemScope : uint8_t {
     EXTERNAL = 2,
     // Baked ONLY into a semaphore's sole off-node writer kernel (census-proven: exactly one
     // 1-instance writer whose ONLY semaphore op is the pinned-channel remote up(); every other
-    // binder provably read-only; initial_value == 0, the staged count is absolute; the object
-    // provably constructed exactly once, in straight-line code; no other same-id binding).
-    // up(noc,x,y,v) keeps a private running count, stages it in THIS hart's CAS-return slot,
-    // plain-writes it to the home cell, and waits for the write to DEPART -- so the slot is
-    // quiescent again before up() returns and any other slot user (an EXTERNAL binding's
-    // returning atomics, another REMOTE_POSTED semaphore) is safe to follow. A sole writer
-    // needs no atomicity, and the count is MONOTONIC, so the home word only ever moves up.
-    // Home binders bake LOCAL_NONATOMIC.
+    // binder provably read-only; initial_value == 0, the staged count is absolute; no other
+    // same-id binding). up(noc,x,y,v) bumps a per-kernel running count (tt_sem_posted_count_,
+    // wrapper-zeroed each launch -- object re-construction is harmless), stages it in THIS
+    // hart's CAS-return slot, plain-writes it to the home cell, and waits for the write to
+    // DEPART -- so the slot is quiescent again before up() returns and any other slot user (an
+    // EXTERNAL binding's returning atomics, another REMOTE_POSTED semaphore) is safe to
+    // follow. A sole writer needs no atomicity, and the count is MONOTONIC, so the home word
+    // only ever moves up. Home binders bake LOCAL_NONATOMIC.
     REMOTE_POSTED = 3,
 };
+
+#if defined(ARCH_QUASAR) && !defined(COMPILE_FOR_TRISC) && !defined(TT_EMULE_USE_L1_POOL)
+// REMOTE_POSTED running counts, indexed by semaphore id (one slot per ring id). Kernel-image
+// state, NOT object state: any number of Semaphore constructions (loops, helpers) keep one
+// monotonic count per semaphore. Zeroed once per launch by the generated kernel_main wrapper
+// in kernels that bake a posted binding (load-time .bss zeroing alone would not survive a
+// relaunch that reuses the resident image). Unreferenced kernels drop it at link (gc-sections).
+inline uint32_t tt_sem_posted_count_[MEM_NOC_SEM_LOCK_SIZE / L1_ALIGNMENT] = {};
+#endif
 
 // The host's chosen mechanism for each bound semaphore id, injected invisibly by codegen:
 // kernel_bindings_generated.h #defines TT_METAL2_SEM_SCOPE_TABLE before this header is ever
@@ -57,7 +66,15 @@ enum class SemScope : uint8_t {
 // generated header -- resolve to LOCAL_NONATOMIC, the historical plain-word behavior. For a
 // compile-time id (`sem::x` is constexpr) the lookup and the mechanism dispatch below fold
 // away entirely; a genuinely runtime id keeps a small predictable branch and stays correct.
+#ifdef TT_SEM_USAGE_PROBE
+// NON-constexpr on purpose in probe mode: the probe's placeholder scope table must not be
+// observable in constant expressions (a discarded if-constexpr arm or template argument could
+// hide semaphore ops from the probe with zero diagnostics). A kernel that needs the scope as a
+// constant fails the probe compile and simply classifies conservative.
+inline SemScope sem_scope_of(uint32_t semaphore_id) {
+#else
 inline __attribute__((always_inline)) constexpr SemScope sem_scope_of(uint32_t semaphore_id) {
+#endif
 #ifdef TT_METAL2_SEM_SCOPE_TABLE
     constexpr SemScope table[] = TT_METAL2_SEM_SCOPE_TABLE;
     constexpr uint32_t n = sizeof(table) / sizeof(table[0]);
@@ -98,11 +115,35 @@ inline __attribute__((always_inline)) constexpr SemScope sem_scope_of(uint32_t s
  *  - relay_unicast(dst_sem, ...): Set a different remote semaphore on one core to this semaphore's local value.
  *  - relay_multicast(dst_sem, ...): Multicast this semaphore's local value into a different destination semaphore.
  */
-template <ProgrammableCoreType core_type = ProgrammableCoreType::TENSIX>
+// ===== Semaphore usage probe (host census; RunSemUsageProbe in program_spec.cpp) =====
+// Under -DTT_SEM_USAGE_PROBE the host runs this TU through the compiler FRONTEND ONLY
+// (-fsyntax-only) with the generated sem:: ids emitted as tag TYPES. The additions below make
+// the compiler itself report every semaphore operation the kernel can perform:
+//  - the class gains a trailing Tag template parameter (deduced from the tag by the guide
+//    below), so each diagnostic names the semaphore it belongs to;
+//  - every method carries [[deprecated("TT_SEM_USE:<op>")]], parsed from the probe's warnings.
+// Everything expands to nothing in real builds; probe binaries are never produced or run.
+#ifdef TT_SEM_USAGE_PROBE
+#define TT_SEM_PROBE_MARK(op) [[deprecated("TT_SEM_USE:" op)]]
+#define TT_SEM_PROBE_TAG , class Tag = void
+#else
+#define TT_SEM_PROBE_MARK(op)
+#define TT_SEM_PROBE_TAG
+#endif
+
+template <ProgrammableCoreType core_type = ProgrammableCoreType::TENSIX TT_SEM_PROBE_TAG>
 class Semaphore {
     // Lets relay_unicast / relay_multicast read dst_sem's private members without a public accessor.
+    // (In probe mode a tagged source relayed into a differently-tagged destination fails to
+    // compile -- the probe treats a failed compile as fully conservative, and relay maps to
+    // the conservative class anyway.)
+#ifdef TT_SEM_USAGE_PROBE
+    template <ProgrammableCoreType OT, class OTag>
+    friend class Semaphore;
+#else
     template <ProgrammableCoreType OT>
     friend class Semaphore;
+#endif
 
     // LOCAL_NONATOMIC and EXTERNAL access the local word through the uncached alias on Quasar
     // (coherent with NoC atomics landing at TL1). DM_LOCAL_CACHED uses the cached alias (AMOs
@@ -161,6 +202,7 @@ public:
      *
      * @param value The value to increment the semaphore by.
      */
+    TT_SEM_PROBE_MARK("up_local")
     __attribute__((always_inline)) void up(uint32_t value) {
         if (scope_ == SemScope::REMOTE_POSTED) {
             ASSERT(false);  // the sole remote writer must use up(noc, x, y, value)
@@ -195,18 +237,35 @@ public:
      * @param value The value to increment the semaphore by.
      * @param vc The virtual channel to use for the transaction (default is NOC_UNICAST_WRITE_VC).
      */
+#ifdef TT_SEM_USAGE_PROBE
+    // Split so the probe distinguishes the pinned-channel 4-arg form (REMOTE_POSTED-eligible)
+    // from an explicit-vc call (conservative). The forwarder's internal 5-arg use warns at THIS
+    // header's location, which the probe's trusted-path filter drops.
+    TT_SEM_PROBE_MARK("up_remote")
+    __attribute__((always_inline)) void up(const Noc& noc, uint32_t noc_x, uint32_t noc_y, uint32_t value) {
+        up(noc, noc_x, noc_y, value, NOC_UNICAST_WRITE_VC);
+    }
+    TT_SEM_PROBE_MARK("up_remote_vc")
+    __attribute__((always_inline)) void up(const Noc& noc, uint32_t noc_x, uint32_t noc_y, uint32_t value, uint8_t vc) {
+#else
     __attribute__((always_inline)) void up(
         const Noc& noc, uint32_t noc_x, uint32_t noc_y, uint32_t value, uint8_t vc = NOC_UNICAST_WRITE_VC) {
+#endif
         ASSERT(scope_ != SemScope::DM_LOCAL_CACHED);
         const uint64_t dest_noc_addr = get_noc_addr(noc_x, noc_y, noc.get_noc_id());
 #if defined(ARCH_QUASAR) && !defined(COMPILE_FOR_TRISC) && !defined(TT_EMULE_USE_L1_POOL)
         // (emule never bakes REMOTE_POSTED -- the census excludes it -- and cannot compile
         // cas_ret_slot(); it falls through to the atomic form below, correct for any scope.)
         if (scope_ == SemScope::REMOTE_POSTED) {
-            // Sole-writer fast path (see the enum doc). The running count lives in the object;
-            // the host bakes this scope only when the source provably constructs the Semaphore
-            // exactly once, in straight-line code (a re-construction would restart the count).
-            posted_count_ += value;
+            // Sole-writer fast path (see the enum doc). The running count lives in a per-kernel
+            // slot keyed by the semaphore id -- NOT in this object -- so re-construction
+            // (loops, helpers) cannot restart it; the generated wrapper zeroes the slots once
+            // per launch. Posted semaphores live on the normal ring, so the id recovers from
+            // the offset exactly as external_lock_l1_offset() does (folds for constexpr ids).
+            const uint32_t sem_id =
+                (static_cast<uint32_t>(l1_offset_) - static_cast<uint32_t>(get_semaphore<core_type>(0))) / L1_ALIGNMENT;
+            ASSERT(sem_id < MEM_NOC_SEM_LOCK_SIZE / L1_ALIGNMENT);
+            const uint32_t posted_count = (tt_sem_posted_count_[sem_id] += value);
             // Stage in this hart's CAS-return slot and deliver with a plain 4B write via the
             // write_cmd_buf route -- the ONLY plain-write path proven on the Quasar RTL (the
             // set_remote/inline-dw routes wedge from DM kernels: NSSW/NWIW, watcher-
@@ -218,7 +277,7 @@ public:
             // ever sees this object's non-decreasing counts.
             const uint32_t stage = cas_ret_slot();
             *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(static_cast<uintptr_t>(MEM_L1_UNCACHED_BASE) + stage) =
-                posted_count_;
+                posted_count;
             noc_async_write(stage, dest_noc_addr, sizeof(uint32_t), noc.get_noc_id());
             noc_async_writes_flushed(noc.get_noc_id());
             return;
@@ -241,6 +300,7 @@ public:
      *
      * @param value The value to decrement the semaphore by.
      */
+    TT_SEM_PROBE_MARK("down")
     __attribute__((always_inline)) void down(uint32_t value) {
         ASSERT(scope_ != SemScope::REMOTE_POSTED);  // sole remote writer: up(noc,x,y,v) only
         auto* sem_addr = local_ptr();
@@ -335,7 +395,7 @@ public:
             noc_semaphore_inc(::get_noc_addr(l1_offset_), (uint32_t)(0u - value));
             noc_async_atomic_barrier();
 #else
-            ASSERT(false);  // compute kernels cannot bind semaphores (host-rejected)
+        ASSERT(false);  // compute kernels cannot bind semaphores (host-rejected)
 #endif
         } else {  // LOCAL_NONATOMIC (legacy)
             do {
@@ -353,6 +413,7 @@ public:
      *
      * @param value The value to wait for.
      */
+    TT_SEM_PROBE_MARK("wait")
     __attribute__((always_inline)) void wait(uint32_t value) {
         ASSERT(scope_ != SemScope::REMOTE_POSTED);  // the sole remote writer has no local cell to watch
         noc_semaphore_wait(local_ptr(), value);
@@ -363,6 +424,7 @@ public:
      *
      * @param value The minimum value to wait for.
      */
+    TT_SEM_PROBE_MARK("wait_min")
     __attribute__((always_inline)) void wait_min(uint32_t value) {
         ASSERT(scope_ != SemScope::REMOTE_POSTED);
         noc_semaphore_wait_min(local_ptr(), value);
@@ -376,6 +438,7 @@ public:
      *
      * @param value The value to set the semaphore to.
      */
+    TT_SEM_PROBE_MARK("set")
     __attribute__((always_inline)) void set(uint32_t value) {
         ASSERT(scope_ != SemScope::REMOTE_POSTED);
         noc_semaphore_set(local_ptr(), value);
@@ -384,6 +447,7 @@ public:
     /**
      * @brief Read the current semaphore value through this scope's coherent view.
      */
+    TT_SEM_PROBE_MARK("value")
     __attribute__((always_inline)) uint32_t value() const {
         invalidate_l1_cache();
         return *local_ptr();
@@ -410,6 +474,10 @@ public:
      * @param noc_y The Y coordinate of the remote core in the NoC.
      * @tparam dst_core_type Programmable core type of the destination (defaults to this Semaphore's core_type).
      */
+#ifndef TT_SEM_USAGE_PROBE
+    // (Omitted in probe mode: relay WRITES the destination semaphore, which no deprecation mark
+    // on *this* can attribute -- so a relay user simply fails the probe compile and every one of
+    // its bindings classifies conservative, destination included.)
     template <ProgrammableCoreType dst_core_type = core_type>
     void relay_unicast(const Noc& noc, const Semaphore<dst_core_type>& dst_sem, uint32_t noc_x, uint32_t noc_y) {
         ASSERT(scope_ != SemScope::DM_LOCAL_CACHED);
@@ -418,6 +486,7 @@ public:
         const uint64_t dst_noc_addr = ::get_noc_addr(noc_x, noc_y, dst_sem.get_l1_addr(), noc.get_noc_id());
         noc_semaphore_set_remote(get_l1_addr(), dst_noc_addr, noc.get_noc_id());
     }
+#endif  // !TT_SEM_USAGE_PROBE (relay_unicast)
 
     /**
      * @brief Set the semaphore value on multiple cores in a specified rectangular region of the NoC.
@@ -434,6 +503,7 @@ public:
      *             (default is NocOptions::DEFAULT which excludes sender)
      */
     template <NocOptions opts = NocOptions::DEFAULT>
+    TT_SEM_PROBE_MARK("mcast")
     void set_multicast(
         const Noc& noc,
         uint32_t noc_x_start,
@@ -453,6 +523,8 @@ public:
         }
     }
 
+#ifndef TT_SEM_USAGE_PROBE
+    // (Omitted in probe mode for the same destination-attribution reason as relay_unicast.)
     /**
      * @brief Relay this semaphore's local value into a different destination semaphore on a rectangular region.
      * @note dst_sem must be a different Semaphore than this one (a different L1 offset). Each core in the region
@@ -494,6 +566,8 @@ public:
         }
     }
 
+#endif  // !TT_SEM_USAGE_PROBE (relay_multicast)
+
     /**
      * @brief Atomically increment the semaphore value on multiple cores in a specified rectangular region of the NoC.
      * @note Sender cannot be part of the multicast destinations.
@@ -506,6 +580,7 @@ public:
      * @param value The value to increment the semaphore by.
      * @param num_dests The number of destination cores in the region.
      */
+    TT_SEM_PROBE_MARK("mcast")
     void inc_multicast(
         const Noc& noc,
         uint32_t noc_x_start,
@@ -523,8 +598,6 @@ public:
 private:
     uintptr_t l1_offset_;  // physical L1 offset of the semaphore word (cached-alias address)
     SemScope scope_;       // host-chosen mechanism (from the invisible codegen table)
-    // REMOTE_POSTED only: the sole writer's private running count (one construction per kernel).
-    uint32_t posted_count_ = 0;
 
     // Local access pointer for reads / non-atomic writes. Uncached alias on Quasar for
     // LOCAL_NONATOMIC and EXTERNAL; cached alias for DM_LOCAL_CACHED.
@@ -550,3 +623,11 @@ private:
         return ::get_noc_addr(noc_x, noc_y, get_l1_addr(), noc);
     }
 };
+
+#ifdef TT_SEM_USAGE_PROBE
+// Probe-mode deduction: a bare `Semaphore x(sem::y)` deduces the tag type, so every diagnostic
+// on x's methods names the semaphore it belongs to. Non-tag constructions (raw ids, runtime
+// variables) deduce int/uint32_t, which the probe cannot attribute and treats as conservative.
+template <class T>
+Semaphore(T) -> Semaphore<ProgrammableCoreType::TENSIX, T>;
+#endif

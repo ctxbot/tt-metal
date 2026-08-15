@@ -4,7 +4,7 @@
 
 // Remote-up SENDER (off the semaphore's node): every thread bumps sem::counter on the
 // semaphore's node, increment_times times, through the class's remote up(). Kept in its own
-// file (not an #ifdef role) so the census access scan sees exactly one role: the scan proves
+// file (not an #ifdef role) so the usage probe sees exactly one role: the compiler proves
 // this kernel's ONLY semaphore op is the remote up(), which -- for a sole 1-instance sender --
 // lets the host bake REMOTE_POSTED (private count + plain value-writes) instead of EXTERNAL.
 // The scope is host-picked (invisible table), so the same source also runs under EXTERNAL

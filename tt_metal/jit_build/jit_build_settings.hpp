@@ -96,6 +96,27 @@ inline void emit_sem_ids_and_tripwires(std::ostream& os, const std::vector<SemBi
     os << "#endif\n";
 }
 
+// emit_sem_probe_bindings: the USAGE-PROBE variant of the sem-ids section (see JitBuildSettings::
+// is_sem_usage_probe). The scope table is emitted separately as the header's first line exactly
+// like a real build (placeholder scopes -- the probe runs BEFORE refinement and feeds it); here
+// each sem:: id becomes a tag TYPE whose uint32_t conversion is deprecation-poisoned, so
+// Semaphore's probe-mode Tag parameter (noc_semaphore.h, TT_SEM_USAGE_PROBE) makes every method
+// diagnostic name its semaphore. No tripwires: the probe TU is frontend-only and never runs.
+inline void emit_sem_probe_bindings(std::ostream& os, const std::vector<SemBindingEntry>& entries) {
+    os << "#include <cstdint>\n";
+    os << "#ifndef COMPILE_FOR_TRISC\n";
+    os << "#include \"api/dataflow/noc_semaphore.h\"\n";
+    os << "#endif\n";
+    os << "namespace sem {\n";
+    for (const auto& entry : entries) {
+        os << "struct " << entry.name << "_t {\n"
+           << "    [[deprecated(\"TT_SEM_USE:bind\")]] constexpr operator std::uint32_t() const { return " << entry.id
+           << "u; }\n"
+           << "};\n"
+           << "inline constexpr " << entry.name << "_t " << entry.name << "{};\n";
+    }
+}
+
 // Metal 2.0: precomputed layout of a kernel's common runtime args (CRTA) buffer.
 //
 // The CRTA buffer is laid out as four back-to-back sections:
@@ -160,6 +181,11 @@ class JitBuildSettings {
 public:
     // Returns the full kernel name
     virtual const std::string& get_full_kernel_name() const = 0;
+
+    // True only for the census-time semaphore USAGE PROBE (program_spec.cpp RunSemUsageProbe):
+    // the bindings header then emits sem:: ids as poisoned tag TYPES (emit_sem_probe_bindings)
+    // instead of plain uint32_t, so a -fsyntax-only compile reports every semaphore op.
+    virtual bool is_sem_usage_probe() const { return false; }
     // Returns the compiler optimization level
     virtual std::string_view get_compiler_opt_level() const = 0;
     // Returns the linker optimization level

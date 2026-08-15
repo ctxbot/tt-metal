@@ -225,7 +225,12 @@ bool write_kernel_bindings_generated_header(
             content << "}  // namespace dfb\n";
         }
 
-        if (!sem_entries.empty()) {
+        if (!sem_entries.empty() && settings.is_sem_usage_probe()) {
+            // USAGE-PROBE build (frontend-only, never runs): ids as poisoned tag types so the
+            // compiler reports every semaphore op. No stubs, no tripwires.
+            tt::tt_metal::emit_sem_probe_bindings(content, sem_entries);
+            content << "}  // namespace sem\n";
+        } else if (!sem_entries.empty()) {
             // Each bound semaphore is its plain id; the mechanism travels in the scope table
             // above. Shared emission (ids + both tripwires): emit_sem_ids_and_tripwires. It
             // leaves `namespace sem {` open for the seeder below.
@@ -626,6 +631,14 @@ void jit_build_genfiles_kernel_include(
 
     if (wrap_kernel_main) {
         kernel_header_content += "\n#undef kernel_main\nvoid kernel_main() {\n";
+        if (has_posted_sem) {
+            // The posted running counts are kernel-image state; a relaunch can reuse the
+            // resident image, so load-time .bss zeroing is not enough -- reset per launch.
+            kernel_header_content +=
+                "    for (unsigned tt_i_ = 0; tt_i_ < sizeof(tt_sem_posted_count_) / sizeof(uint32_t); tt_i_++) {\n"
+                "        tt_sem_posted_count_[tt_i_] = 0;\n"
+                "    }\n";
+        }
         if (has_cached_sem) {
             kernel_header_content += "    sem::init_dm_cached();\n";
         }

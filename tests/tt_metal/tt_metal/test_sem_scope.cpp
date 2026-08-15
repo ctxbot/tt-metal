@@ -35,7 +35,7 @@ namespace tt::tt_metal {
 // DM_LOCAL_CACHED (32-bit AMO on the cached alias), EXTERNAL (self-targeted
 // NoC atomic), REMOTE_POSTED (sole off-node writer's staged plain writes).
 // The host resolves each semaphore's mechanism from a binder-topology census
-// plus a conservative source access-scan refinement (program_spec.cpp) --
+// plus a conservative compiler-frontend usage probe (program_spec.cpp) --
 // nothing is configurable on the SemaphoreSpec -- so every test here
 // constructs the SHAPE (topology + provable source) that makes the host pick
 // the mechanism under test. Raw hardware atomicity is covered by the keystone
@@ -793,7 +793,7 @@ TEST_F(SemScopeFixture, TestCachedExternalCoexistence) {
 // manifests as a hang; the exact-count EXPECTs catch overshoot and wrong-word landings.
 
 // GAP-8 KEYSTONE: one off-node sender thread whose only op is the pinned-channel remote up(),
-// plus a provably read-only receiver -- the access scan proves the shape, so the sender bakes
+// plus a provably read-only receiver -- the usage probe proves the shape, so the sender bakes
 // REMOTE_POSTED (private running count, staged in its CAS-return slot, delivered by plain
 // 4B writes -- NOT the inline-dw primitive, which hangs on this RTL) and the receiver bakes
 // LOCAL_NONATOMIC. BOTH baked scopes are asserted (the sender reports its own table entry, so
@@ -820,12 +820,12 @@ TEST_F(SemScopeFixture, TestRemotePostedSoleWriterExactCount) {
                                       "(a LOST/reordered write would hang in the receiver's wait_min, not fail here).";
 }
 
-// NEGATIVE (construction-once gate): identical sole-off-node-writer topology, but the sender
-// constructs its Semaphore INSIDE the up loop. The posted running count lives in the object, so
-// the census must refuse REMOTE_POSTED (a per-iteration re-construction would restart it) and
-// keep BOTH sides EXTERNAL -- under which the per-iteration construction is harmless, so the
-// count still lands exactly.
-TEST_F(SemScopeFixture, TestCensusLoopConstructedSenderStaysExternal) {
+// RE-CONSTRUCTION PROOF: identical sole-off-node-writer topology, but the sender constructs
+// its Semaphore INSIDE the up loop -- a fresh object every iteration. The posted running count
+// is kernel-image state (tt_sem_posted_count_, wrapper-zeroed per launch), not object state, so
+// the census still bakes REMOTE_POSTED and the count must land exactly. This pins the one
+// hazard of the posted design that used to need a construction-once proof.
+TEST_F(SemScopeFixture, TestRemotePostedLoopConstructedSenderExactCount) {
     if (!has_second_node()) {
         GTEST_SKIP() << "needs >= 2 worker nodes for an off-node sender";
     }
@@ -837,11 +837,12 @@ TEST_F(SemScopeFixture, TestCensusLoopConstructedSenderStaysExternal) {
         r.sender_scope,
         r.value,
         iterations);
-    EXPECT_EQ(r.sender_scope, scope_val(SemScope::EXTERNAL))
-        << "a loop-constructed sender is not provably construction-once: POSTED must not bake";
-    EXPECT_EQ(r.receiver_scope, scope_val(SemScope::EXTERNAL))
-        << "with no posted writer the refinement must leave the whole semaphore EXTERNAL";
-    EXPECT_EQ(r.value, iterations) << "EXTERNAL remote ups from a loop-constructed object lost updates";
+    EXPECT_EQ(r.sender_scope, scope_val(SemScope::REMOTE_POSTED))
+        << "re-construction is safe (kernel-slot count): the sole writer must still bake POSTED";
+    EXPECT_EQ(r.receiver_scope, scope_val(SemScope::LOCAL_NONATOMIC))
+        << "the home side of a posted semaphore keeps the plain word";
+    EXPECT_EQ(r.value, iterations)
+        << "per-iteration re-construction restarted the posted count (kernel-slot design broken)";
 }
 
 // CONTRAST: all user-DM sender threads hammer the SAME remote word -- multiple writer

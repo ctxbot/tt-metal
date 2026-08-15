@@ -1491,6 +1491,11 @@ FORCE_INLINE void noc_async_write_shard(
  */
 // clang-format on
 template <ProgrammableCoreType type = ProgrammableCoreType::TENSIX>
+#ifdef TT_SEM_USAGE_PROBE
+// Semaphore usage probe (see noc_semaphore.h): a raw ring-address take in kernel code is
+// unprovable, so the probe flags it. Uses inside trusted headers are filtered by location.
+[[deprecated("TT_SEM_USE:raw")]]
+#endif
 FORCE_INLINE uintptr_t get_semaphore(uint32_t semaphore_id) {
     return (uintptr_t)sem_l1_base[static_cast<int>(type)] + semaphore_id * L1_ALIGNMENT;
 }
