@@ -59,6 +59,12 @@ struct UnifiedRoutedExpertFfnParams {
     // counts[global_id]).
     uint32_t local_expert_id = 0;
 
+    // Number of contiguous local experts represented by each weight tensor.
+    // One means the legacy per-expert tensor path. Values >1 select the packed
+    // DRAM slab path: the program derives this expert's address by a fixed tile
+    // stride while retaining the logical per-expert K/N geometry below.
+    uint32_t packed_expert_count = 1;
+
     // When true, x is a shared buffer and the reader offsets its x reads by this
     // expert's region start (expert_region_offsets[global_id]) — fusing what
     // ttnn::extract did. Requires expert_region_offsets. False => x is per-expert.
@@ -89,13 +95,21 @@ struct UnifiedRoutedExpertFfnParams {
         "chunk_M_tiles",
         "m_tiles",
         "local_expert_id",
+        "packed_expert_count",
         "read_x_at_offset",
         "x_is_row_major",
         "activation",
         "fuse_bias");
     auto attribute_values() const {
         return std::forward_as_tuple(
-            chunk_M_tiles, m_tiles, local_expert_id, read_x_at_offset, x_is_row_major, activation, fuse_bias);
+            chunk_M_tiles,
+            m_tiles,
+            local_expert_id,
+            packed_expert_count,
+            read_x_at_offset,
+            x_is_row_major,
+            activation,
+            fuse_bias);
     }
 };
 

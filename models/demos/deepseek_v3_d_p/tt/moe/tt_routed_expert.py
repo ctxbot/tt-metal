@@ -12,6 +12,9 @@ Unlike TtSharedExpert, this module:
 - Each device holds weights for `experts_per_chip` local experts
 """
 
+import json
+import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -33,10 +36,183 @@ COMPUTE_KERNEL_CONFIG_LOFI = ttnn.WormholeComputeKernelConfig(
 
 
 class TtRoutedExpert(LightweightModule):
+    PACKED_CACHE_FORMAT = "packed_v1"
+
+    @staticmethod
+    def _packed_metadata_path(cache_path: Path, cache_name_prefix: str) -> Path:
+        return cache_path / f"{cache_name_prefix}.{TtRoutedExpert.PACKED_CACHE_FORMAT}.json"
+
+    @staticmethod
+    def _packed_cache_schema(
+        mesh_device: ttnn.MeshDevice,
+        experts_per_chip: int,
+        emb_dim: int,
+        hidden_dim: int,
+        weights_dtype: ttnn.DataType,
+    ) -> dict:
+        """Schema for a single projection-family packed routed-expert cache."""
+        return {
+            "format": TtRoutedExpert.PACKED_CACHE_FORMAT,
+            "mesh_shape": list(mesh_device.shape),
+            "experts_per_chip": experts_per_chip,
+            "weights_dtype": str(weights_dtype),
+            "layout": "TILE",
+            "projections": {
+                "gate": {
+                    "logical_shape": [experts_per_chip * emb_dim, hidden_dim],
+                    "stride_tiles": emb_dim // 32 * (hidden_dim // 32),
+                },
+                "up": {
+                    "logical_shape": [experts_per_chip * emb_dim, hidden_dim],
+                    "stride_tiles": emb_dim // 32 * (hidden_dim // 32),
+                },
+                "down": {
+                    "logical_shape": [experts_per_chip * hidden_dim, emb_dim],
+                    "stride_tiles": hidden_dim // 32 * (emb_dim // 32),
+                },
+            },
+        }
+
+    @staticmethod
+    def _write_packed_cache_schema(
+        cache_path: Path,
+        cache_name_prefix: str,
+        mesh_device: ttnn.MeshDevice,
+        experts_per_chip: int,
+        emb_dim: int,
+        hidden_dim: int,
+        weights_dtype: ttnn.DataType,
+    ) -> None:
+        cache_path.mkdir(parents=True, exist_ok=True)
+        TtRoutedExpert._packed_metadata_path(cache_path, cache_name_prefix).write_text(
+            json.dumps(
+                TtRoutedExpert._packed_cache_schema(mesh_device, experts_per_chip, emb_dim, hidden_dim, weights_dtype),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    @staticmethod
+    def validate_packed_cache_schema(
+        cache_path: Path | None,
+        cache_name_prefix: str | None,
+        mesh_device: ttnn.MeshDevice,
+        experts_per_chip: int,
+        emb_dim: int,
+        hidden_dim: int,
+        weights_dtype: ttnn.DataType,
+    ) -> bool:
+        """Validate packed artifacts before any cache-backed TTNN allocation."""
+        if cache_path is None or cache_name_prefix is None:
+            return False
+        metadata_path = TtRoutedExpert._packed_metadata_path(cache_path, cache_name_prefix)
+        try:
+            actual = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug(f"TTNN packed cache metadata unavailable at {metadata_path}: {exc}")
+            return False
+        expected = TtRoutedExpert._packed_cache_schema(
+            mesh_device, experts_per_chip, emb_dim, hidden_dim, weights_dtype
+        )
+        if actual != expected:
+            logger.warning(f"TTNN packed cache metadata incompatible at {metadata_path}; falling back to legacy cache")
+            return False
+        return True
+
+    @staticmethod
+    def _as_tensor_with_hydration_metrics(
+        tensor: torch.Tensor,
+        *,
+        mesh_mapper,
+        device: ttnn.MeshDevice | None,
+        weights_dtype: ttnn.DataType,
+        cache_file_name: str | None,
+        cache_format: str,
+        projection: str,
+    ) -> ttnn.Tensor:
+        start = time.perf_counter()
+        result = ttnn.as_tensor(
+            tensor,
+            mesh_mapper=mesh_mapper,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            dtype=weights_dtype,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG if device else None,
+            cache_file_name=cache_file_name,
+        )
+        if device is not None and cache_file_name is not None:
+            cache_prefix = Path(cache_file_name)
+            cache_bytes = sum(
+                path.stat().st_size for path in cache_prefix.parent.glob(f"{cache_prefix.name}*.tensorbin")
+            )
+            logger.info(
+                "routed_expert_hydration format={} projection={} physical_loads=1 cache_bytes={} "
+                "routed_expert_hydration_ms={:.3f}",
+                cache_format,
+                projection,
+                cache_bytes,
+                (time.perf_counter() - start) * 1000,
+            )
+        return result
+
+    @staticmethod
+    def _pack_expert_projection_family(
+        torch_weights: list[dict],
+        experts_per_chip: int,
+        mesh_rows: int,
+        mesh_cols: int,
+        projection: str,
+    ) -> torch.Tensor:
+        """Pack one projection family in mesh-local, expert-major K order."""
+        projection_index = {"gate": 0, "up": 1, "down": 2}[projection]
+        per_expert = []
+        for local_expert_idx in range(experts_per_chip):
+            gathered = ExpertMapping.gather_weights_for_mesh_distribution(
+                torch_weights, local_expert_idx, mesh_rows, mesh_cols, experts_per_chip
+            )[projection_index]
+            stacked = torch.stack([weight.T.contiguous() for weight in gathered], dim=0)
+            per_expert.append(stacked.reshape(mesh_rows, mesh_cols, *stacked.shape[1:]))
+        return torch.cat(per_expert, dim=2)
+
+    @staticmethod
+    def _packed_cache_requested() -> bool:
+        """Whether this process should prefer the versioned packed cache format.
+
+        The opt-in keeps existing shared tensorbin caches and users on the proven
+        per-expert reader until the packed artifacts have been generated and
+        validated.  A missing/incomplete packed set always falls back to legacy.
+        """
+        return os.environ.get("TT_ROUTED_EXPERT_CACHE_FORMAT") == TtRoutedExpert.PACKED_CACHE_FORMAT
+
+    @staticmethod
+    def check_packed_cache_complete(cache_path: Path, cache_name_prefix: str) -> bool:
+        """True only when all three packed entries and their schema are present."""
+        from models.demos.deepseek_v3_d_p.utils.fast_cache_checker import pattern_exists
+
+        if not TtRoutedExpert._packed_metadata_path(cache_path, cache_name_prefix).is_file():
+            logger.debug(
+                f"TTNN packed cache metadata missing: {cache_name_prefix}.{TtRoutedExpert.PACKED_CACHE_FORMAT}"
+            )
+            return False
+        for proj in ["gate", "up", "down"]:
+            pattern = f"{cache_name_prefix}.{TtRoutedExpert.PACKED_CACHE_FORMAT}_{proj}*.tensorbin"
+            if not pattern_exists(pattern, "RoutedExpertPacked"):
+                logger.debug(
+                    f"TTNN packed cache missing: {cache_name_prefix}.{TtRoutedExpert.PACKED_CACHE_FORMAT}_{proj}"
+                )
+                return False
+        return True
+
     @staticmethod
     def check_cache_complete(cache_path: Path, cache_name_prefix: str, experts_per_chip: int) -> bool:
         """Check if all routed expert weight cache files exist."""
         from models.demos.deepseek_v3_d_p.utils.fast_cache_checker import pattern_exists
+
+        if TtRoutedExpert._packed_cache_requested() and TtRoutedExpert.check_packed_cache_complete(
+            cache_path, cache_name_prefix
+        ):
+            return True
 
         for local_expert_idx in range(experts_per_chip):
             for proj in ["gate", "up", "down"]:
@@ -45,6 +221,72 @@ class TtRoutedExpert(LightweightModule):
                     logger.debug(f"TTNN cache missing: {cache_name_prefix}.local_{local_expert_idx}_{proj}")
                     return False
         return True
+
+    @staticmethod
+    def _convert_and_cache_packed_expert_weights(
+        torch_weights: list[dict] | None,
+        experts_per_chip: int,
+        mesh_device: ttnn.MeshDevice,
+        weights_dtype: ttnn.DataType,
+        cache_path: Path | None,
+        cache_name_prefix: str | None,
+        device: ttnn.MeshDevice | None = None,
+        *,
+        emb_dim: int | None = None,
+        hidden_dim: int | None = None,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor, ttnn.Tensor] | None:
+        """Load or write one DRAM tensorbin per projection family.
+
+        Each mesh device receives a contiguous expert-major slab with shape
+        ``(experts_per_chip * K, N)``.  The packed routed-expert kernel uses
+        the fixed tile stride to address its local expert directly; this method
+        intentionally does not construct 32 device tensors/views after loading.
+        """
+
+        def _cache_name(proj: str) -> str | None:
+            if cache_path is None or cache_name_prefix is None:
+                return None
+            return str(cache_path / f"{cache_name_prefix}.{TtRoutedExpert.PACKED_CACHE_FORMAT}_{proj}")
+
+        mesh_rows, mesh_cols = mesh_device.shape
+        mapper = ExpertMapping.get_weights_mesh_mapper(mesh_device)
+
+        if torch_weights is not None:
+            # Concatenate per-device matrices along K. This is the byte/tile order
+            # the packed kernel addresses: expert e begins at e * K * N tiles.
+            packed_gate = TtRoutedExpert._pack_expert_projection_family(
+                torch_weights, experts_per_chip, mesh_rows, mesh_cols, "gate"
+            )
+            packed_up = TtRoutedExpert._pack_expert_projection_family(
+                torch_weights, experts_per_chip, mesh_rows, mesh_cols, "up"
+            )
+            packed_down = TtRoutedExpert._pack_expert_projection_family(
+                torch_weights, experts_per_chip, mesh_rows, mesh_cols, "down"
+            )
+        else:
+            assert emb_dim is not None and hidden_dim is not None
+            packed_gate = torch.empty(mesh_rows, mesh_cols, experts_per_chip * emb_dim, hidden_dim)
+            packed_up = torch.empty(mesh_rows, mesh_cols, experts_per_chip * emb_dim, hidden_dim)
+            packed_down = torch.empty(mesh_rows, mesh_cols, experts_per_chip * hidden_dim, emb_dim)
+
+        packed = []
+        for proj, tensor in [("gate", packed_gate), ("up", packed_up), ("down", packed_down)]:
+            packed.append(
+                TtRoutedExpert._as_tensor_with_hydration_metrics(
+                    tensor,
+                    mesh_mapper=mapper,
+                    device=device,
+                    weights_dtype=weights_dtype,
+                    cache_file_name=_cache_name(proj),
+                    cache_format=TtRoutedExpert.PACKED_CACHE_FORMAT,
+                    projection=proj,
+                )
+            )
+
+        if device is None:
+            del packed
+            return None
+        return tuple(packed)
 
     @staticmethod
     def _convert_and_cache_expert_weights(
@@ -111,35 +353,34 @@ class TtRoutedExpert(LightweightModule):
                 stacked_up = torch.empty(mesh_rows, mesh_cols, emb_dim, hidden_dim)
                 stacked_down = torch.empty(mesh_rows, mesh_cols, hidden_dim, emb_dim)
 
-            mem = ttnn.DRAM_MEMORY_CONFIG if device else None
             mapper = ExpertMapping.get_weights_mesh_mapper(mesh_device)
 
-            gate_tt = ttnn.as_tensor(
+            gate_tt = TtRoutedExpert._as_tensor_with_hydration_metrics(
                 stacked_gate,
                 mesh_mapper=mapper,
-                layout=ttnn.TILE_LAYOUT,
                 device=device,
-                dtype=weights_dtype,
-                memory_config=mem,
+                weights_dtype=weights_dtype,
                 cache_file_name=_cache_name(f"local_{local_expert_idx}_gate"),
+                cache_format="legacy",
+                projection="gate",
             )
-            up_tt = ttnn.as_tensor(
+            up_tt = TtRoutedExpert._as_tensor_with_hydration_metrics(
                 stacked_up,
                 mesh_mapper=mapper,
-                layout=ttnn.TILE_LAYOUT,
                 device=device,
-                dtype=weights_dtype,
-                memory_config=mem,
+                weights_dtype=weights_dtype,
                 cache_file_name=_cache_name(f"local_{local_expert_idx}_up"),
+                cache_format="legacy",
+                projection="up",
             )
-            down_tt = ttnn.as_tensor(
+            down_tt = TtRoutedExpert._as_tensor_with_hydration_metrics(
                 stacked_down,
                 mesh_mapper=mapper,
-                layout=ttnn.TILE_LAYOUT,
                 device=device,
-                dtype=weights_dtype,
-                memory_config=mem,
+                weights_dtype=weights_dtype,
                 cache_file_name=_cache_name(f"local_{local_expert_idx}_down"),
+                cache_format="legacy",
+                projection="down",
             )
 
             if device is None:
@@ -214,10 +455,30 @@ class TtRoutedExpert(LightweightModule):
         cache_path: Path,
         cache_name_prefix: str,
     ):
-        """Build TTNN cache for routed experts without device copy."""
-        TtRoutedExpert._convert_and_cache_expert_weights(
+        """Build the selected cache format without device copy.
+
+        Set ``TT_ROUTED_EXPERT_CACHE_FORMAT=packed_v1`` to generate the three
+        packed entries in an isolated cache directory.  The default preserves
+        the existing per-expert tensorbin layout.
+        """
+        converter = (
+            TtRoutedExpert._convert_and_cache_packed_expert_weights
+            if TtRoutedExpert._packed_cache_requested()
+            else TtRoutedExpert._convert_and_cache_expert_weights
+        )
+        converter(
             torch_weights, experts_per_chip, mesh_device, weights_dtype, cache_path, cache_name_prefix, device=None
         )
+        if TtRoutedExpert._packed_cache_requested():
+            TtRoutedExpert._write_packed_cache_schema(
+                cache_path,
+                cache_name_prefix,
+                mesh_device,
+                experts_per_chip,
+                torch_weights[0]["gate_proj"].shape[1],
+                torch_weights[0]["gate_proj"].shape[0],
+                weights_dtype,
+            )
 
     """
     TTNN implementation of Routed Expert module.
@@ -332,13 +593,38 @@ class TtRoutedExpert(LightweightModule):
         self.up_projs_pc = None
         self.down_projs_pc = None
 
+        self.packed_gate_proj = None
+        self.packed_up_proj = None
+        self.packed_down_proj = None
+        self.using_packed_cache = self._packed_cache_requested() and (
+            torch_weights is not None
+            or (
+                weight_cache_path is not None
+                and self.check_packed_cache_complete(weight_cache_path, cache_name_prefix)
+                and self.validate_packed_cache_schema(
+                    weight_cache_path,
+                    cache_name_prefix,
+                    mesh_device,
+                    experts_per_chip,
+                    emb_dim,
+                    hidden_dim,
+                    weights_dtype,
+                )
+            )
+        )
+
         if torch_weights is not None:
             assert len(torch_weights) == total_experts, (
                 f"Expected {total_experts} expert weights (num_devices={self.num_devices} * "
                 f"experts_per_chip={experts_per_chip}), got {len(torch_weights)}"
             )
             logger.debug(f"Creating weights from provided torch tensors ({total_experts} experts)")
-            result = self._convert_and_cache_expert_weights(
+            converter = (
+                self._convert_and_cache_packed_expert_weights
+                if self.using_packed_cache
+                else self._convert_and_cache_expert_weights
+            )
+            result = converter(
                 torch_weights,
                 experts_per_chip,
                 self.mesh_device,
@@ -348,8 +634,16 @@ class TtRoutedExpert(LightweightModule):
                 device=self.mesh_device,
             )
         elif weight_cache_path is not None:
-            logger.debug(f"Loading weights from cache ({experts_per_chip} local experts)")
-            result = self._convert_and_cache_expert_weights(
+            logger.debug(
+                f"Loading {'packed' if self.using_packed_cache else 'legacy'} weights from cache "
+                f"({experts_per_chip} local experts)"
+            )
+            converter = (
+                self._convert_and_cache_packed_expert_weights
+                if self.using_packed_cache
+                else self._convert_and_cache_expert_weights
+            )
+            result = converter(
                 None,
                 experts_per_chip,
                 self.mesh_device,
@@ -382,7 +676,10 @@ class TtRoutedExpert(LightweightModule):
             )
 
         assert result is not None, "Expected weight tensors to be returned when device is provided"
-        self.gate_projs, self.up_projs, self.down_projs = result
+        if self.using_packed_cache:
+            self.packed_gate_proj, self.packed_up_proj, self.packed_down_proj = result
+        else:
+            self.gate_projs, self.up_projs, self.down_projs = result
 
         # Convert + distribute optional per-expert biases (gpt-oss), one (1, N)
         # tensor per local expert, mesh-distributed like the weights.
@@ -511,6 +808,9 @@ class TtRoutedExpert(LightweightModule):
                 gate_biases=self.gate_biases,
                 up_biases=self.up_biases,
                 down_biases=self.down_biases,
+                packed_gate_proj=self.packed_gate_proj,
+                packed_up_proj=self.packed_up_proj,
+                packed_down_proj=self.packed_down_proj,
             )
             logger.debug(f"Final expert_outputs shape: {expert_outputs.shape}")
             return expert_outputs

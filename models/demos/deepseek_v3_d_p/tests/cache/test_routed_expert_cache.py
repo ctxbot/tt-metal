@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,31 +26,79 @@ from models.demos.deepseek_v3_d_p.utils.fast_cache_checker import init_checker, 
 from tests.ttnn.utils_for_testing import comp_pcc
 
 CACHE_DIR = Path("/tmp/DS_PREFILL_routed_expert")
+PACKED_CACHE_DIR = Path("/tmp/DS_PREFILL_routed_expert_packed")
 
 
 @pytest.fixture(autouse=True)
 def cleanup_cache():
-    if CACHE_DIR.exists():
-        shutil.rmtree(CACHE_DIR)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for cache_dir in [CACHE_DIR, PACKED_CACHE_DIR]:
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
     yield
     report_and_clear()
+
+
+def test_packed_cache_schema_and_expert_ordering(tmp_path):
+    """Packed metadata rejects incompatibility and preserves mesh expert order."""
+    mesh_device = SimpleNamespace(shape=(2, 2))
+    experts_per_chip, emb_dim, hidden_dim = 2, 32, 32
+    torch_weights = [
+        {
+            "gate_proj": torch.full((hidden_dim, emb_dim), global_expert, dtype=torch.float32),
+            "up_proj": torch.zeros(hidden_dim, emb_dim),
+            "down_proj": torch.zeros(emb_dim, hidden_dim),
+        }
+        for global_expert in range(8)
+    ]
+    packed_gate = TtRoutedExpert._pack_expert_projection_family(
+        torch_weights, experts_per_chip, *mesh_device.shape, "gate"
+    )
+    for row in range(mesh_device.shape[0]):
+        for col in range(mesh_device.shape[1]):
+            for local_expert in range(experts_per_chip):
+                global_expert = ExpertMapping.get_global_expert_idx(
+                    group=col,
+                    chip=row,
+                    local_expert=local_expert,
+                    experts_per_chip=experts_per_chip,
+                    dispatch_group_size=mesh_device.shape[0],
+                    num_dispatch_groups=mesh_device.shape[1],
+                )
+                start = local_expert * emb_dim
+                assert torch.equal(
+                    packed_gate[row, col, start : start + emb_dim],
+                    torch.full((emb_dim, hidden_dim), global_expert, dtype=torch.float32),
+                )
+
+    TtRoutedExpert._write_packed_cache_schema(
+        tmp_path, "routed_expert", mesh_device, experts_per_chip, emb_dim, hidden_dim, ttnn.bfloat4_b
+    )
+    metadata_path = tmp_path / "routed_expert.packed_v1.json"
+    assert json.loads(metadata_path.read_text())["format"] == TtRoutedExpert.PACKED_CACHE_FORMAT
+    assert TtRoutedExpert.validate_packed_cache_schema(
+        tmp_path, "routed_expert", mesh_device, experts_per_chip, emb_dim, hidden_dim, ttnn.bfloat4_b
+    )
+    metadata_path.write_text("{}")
+    assert not TtRoutedExpert.validate_packed_cache_schema(
+        tmp_path, "routed_expert", mesh_device, experts_per_chip, emb_dim, hidden_dim, ttnn.bfloat4_b
+    )
 
 
 @pytest.mark.parametrize(
     "mesh_device, device_params",
     [
         pytest.param(
-            (2, 2),
+            (2, 4),
             {"fabric_config": ttnn.FabricConfig.FABRIC_1D},
-            marks=pytest.mark.requires_mesh_topology(mesh_shape=(2, 2), topology="linear"),
-            id="linear-2x2",
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(2, 4), topology="mesh-2x4"),
+            id="mesh-2x4",
         ),
     ],
     indirect=["mesh_device", "device_params"],
 )
-def test_routed_expert_weights_cold_warm_cache(mesh_device, device_params):
-    """Test: weights → cold cache → warm cache produce identical outputs."""
+def test_routed_expert_weights_cold_warm_cache(mesh_device, device_params, monkeypatch):
+    """Legacy and packed cache hydration produce identical routed-expert output."""
     torch.manual_seed(42)
 
     # Use realistic parameters
@@ -264,6 +314,47 @@ def test_routed_expert_weights_cold_warm_cache(mesh_device, device_params):
     output3_tt = expert_warm(ttnn.clone(dispatched_buffer_tt), expert_token_counts_tt, expert_region_offsets_tt)
     output3 = to_torch_expert(output3_tt)
 
+    # === Path 4: Packed Cache ===
+    # The packed format is deliberately opt-in and isolated from the legacy
+    # directory. It must load just three physical routed-expert tensorbins and
+    # pass their base tensors to the packed-base C++ path without materialising
+    # one TTNN tensor per local expert.
+    monkeypatch.setenv("TT_ROUTED_EXPERT_CACHE_FORMAT", TtRoutedExpert.PACKED_CACHE_FORMAT)
+    init_checker(PACKED_CACHE_DIR)
+    TtRoutedExpert.build_ttnn_cache(
+        torch_weights,
+        experts_per_chip,
+        mesh_device,
+        weights_dtype,
+        PACKED_CACHE_DIR,
+        "routed_expert",
+    )
+    init_checker(PACKED_CACHE_DIR)
+    assert TtRoutedExpert.check_packed_cache_complete(PACKED_CACHE_DIR, "routed_expert")
+    packed_files = list(PACKED_CACHE_DIR.glob("routed_expert.packed_v1_*.tensorbin"))
+    assert len(packed_files) == 3
+
+    profiler.start("packed_load")
+    expert_packed = TtRoutedExpert(
+        mesh_device=mesh_device,
+        experts_per_chip=experts_per_chip,
+        global_expert_idx_table=global_expert_idx_tt,
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        max_tokens=max_dispatched_tokens_per_expert,
+        torch_weights=None,
+        weights_dtype=weights_dtype,
+        weight_cache_path=PACKED_CACHE_DIR,
+        cache_name_prefix="routed_expert",
+        activation=ttnn.RoutedExpertActivation.Silu,
+    )
+    profiler.end("packed_load")
+    assert expert_packed.using_packed_cache
+    assert expert_packed.gate_projs == []
+    assert expert_packed.packed_gate_proj is not None
+    output4_tt = expert_packed(ttnn.clone(dispatched_buffer_tt), expert_token_counts_tt, expert_region_offsets_tt)
+    output4 = to_torch_expert(output4_tt)
+
     # === Validation ===
     # Debug: check output stats
     logger.info(
@@ -278,6 +369,7 @@ def test_routed_expert_weights_cold_warm_cache(mesh_device, device_params):
 
     passed_cold, pcc_cold = comp_pcc(output1, output2)
     passed_warm, pcc_warm = comp_pcc(output1, output3)
+    passed_packed, pcc_packed = comp_pcc(output1, output4)
 
     logger.info(f"Routed Expert Cache Test:")
     logger.info(f"  Weights vs Cold Cache PCC: {pcc_cold}")
@@ -285,6 +377,9 @@ def test_routed_expert_weights_cold_warm_cache(mesh_device, device_params):
     logger.info(f"  build_cache: {profiler.get('build_cache')*1000:.1f} ms")
     logger.info(f"  cold_load:   {profiler.get('cold_load')*1000:.1f} ms")
     logger.info(f"  warm_load:   {profiler.get('warm_load')*1000:.1f} ms")
+    logger.info(f"  packed_load: {profiler.get('packed_load')*1000:.1f} ms")
+    logger.info(f"  Weights vs Packed Cache PCC: {pcc_packed}")
 
     assert passed_cold, f"Cold cache mismatch: PCC={pcc_cold}"
     assert passed_warm, f"Warm cache mismatch: PCC={pcc_warm}"
+    assert passed_packed, f"Packed cache mismatch: PCC={pcc_packed}"

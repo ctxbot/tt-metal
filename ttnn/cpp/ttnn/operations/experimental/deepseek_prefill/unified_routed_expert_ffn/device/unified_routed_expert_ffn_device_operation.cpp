@@ -58,17 +58,30 @@ void UnifiedRoutedExpertFfnDeviceOperation::validate_on_program_cache_miss(
     const auto& up_shape = t.up_proj.padded_shape();
     const auto& down_shape = t.down_proj.padded_shape();
 
+    TT_FATAL(op.packed_expert_count > 0, "packed_expert_count must be > 0");
     TT_FATAL(
-        x_shape[-1] == gate_shape[-2] && x_shape[-1] == up_shape[-2],
+        gate_shape[-2] % op.packed_expert_count == 0 && up_shape[-2] % op.packed_expert_count == 0 &&
+            down_shape[-2] % op.packed_expert_count == 0,
+        "packed projection K dimensions must divide packed_expert_count {} (got gate={}, up={}, down={})",
+        op.packed_expert_count,
+        gate_shape[-2],
+        up_shape[-2],
+        down_shape[-2]);
+    const auto gate_k = gate_shape[-2] / op.packed_expert_count;
+    const auto up_k = up_shape[-2] / op.packed_expert_count;
+    const auto down_k = down_shape[-2] / op.packed_expert_count;
+
+    TT_FATAL(
+        x_shape[-1] == gate_k && x_shape[-1] == up_k,
         "x's last dim {} must match gate/up's K dim ({}, {})",
         x_shape[-1],
-        gate_shape[-2],
-        up_shape[-2]);
+        gate_k,
+        up_k);
     TT_FATAL(
-        gate_shape[-1] == up_shape[-1] && gate_shape[-1] == down_shape[-2],
+        gate_shape[-1] == up_shape[-1] && gate_shape[-1] == down_k,
         "gate/up N ({}) must equal down K ({})",
         gate_shape[-1],
-        down_shape[-2]);
+        down_k);
     TT_FATAL(down_shape[-1] == x_shape[-1], "down N ({}) must equal x K ({})", down_shape[-1], x_shape[-1]);
 
     constexpr uint32_t TILE = tt::constants::TILE_HEIGHT;
@@ -123,6 +136,11 @@ void UnifiedRoutedExpertFfnDeviceOperation::validate_on_program_cache_miss(
         "local_expert_id ({}) >= idx_table size ({})",
         op.local_expert_id,
         t.global_expert_idx_table.logical_shape()[-1]);
+    TT_FATAL(
+        op.packed_expert_count == 1 || op.local_expert_id < op.packed_expert_count,
+        "local_expert_id ({}) must be < packed_expert_count ({})",
+        op.local_expert_id,
+        op.packed_expert_count);
 
     // Direct-write mode: expert_region_offsets present => the writer places
     // this expert's output into the SHARED optional_output buffer at the
@@ -318,6 +336,7 @@ ttnn::Tensor unified_routed_expert_ffn(
     uint32_t m_tiles,
     bool read_x_at_offset,
     bool x_is_row_major,
+    uint32_t packed_expert_count,
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
     const std::optional<ttnn::Tensor>& optional_output,
     const std::optional<ttnn::Tensor>& expert_region_offsets,
@@ -332,6 +351,7 @@ ttnn::Tensor unified_routed_expert_ffn(
             .chunk_M_tiles = chunk_M_tiles,
             .m_tiles = m_tiles,
             .local_expert_id = local_expert_id,
+            .packed_expert_count = packed_expert_count,
             .read_x_at_offset = read_x_at_offset,
             .x_is_row_major = x_is_row_major,
             .activation = activation,

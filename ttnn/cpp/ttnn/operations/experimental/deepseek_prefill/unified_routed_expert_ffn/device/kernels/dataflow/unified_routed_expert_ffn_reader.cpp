@@ -223,6 +223,18 @@ void kernel_main() {
     CircularBuffer cb_down_bias_obj(cb_down_bias);
 #endif
 
+    // Packed expert slabs retain the original DRAM-interleaved buffer base.
+    // Add these logical page offsets to reads rather than shifting a physical
+    // byte address, which would select the wrong DRAM bank/page sequence.
+    constexpr uint32_t packed_page_offset_rt = M_ROW_NOC_RT_OFFSET + 2 * GRID_X_NOC + 1
+#ifdef FUSE_BIAS
+                                               + 3
+#endif
+        ;
+    const uint32_t gate_page_offset = get_arg_val<uint32_t>(packed_page_offset_rt + 0);
+    const uint32_t up_page_offset = get_arg_val<uint32_t>(packed_page_offset_rt + 1);
+    const uint32_t down_page_offset = get_arg_val<uint32_t>(packed_page_offset_rt + 2);
+
     // D2.0 NoC handles. `noc` uses default noc_index for mcasts/sem ops.
     // `noc_read` forces NoC 0 for DRAM weight/page reads — the kernel issues
     // those concurrently with mcast traffic on the kernel's default NoC for
@@ -603,7 +615,7 @@ void kernel_main() {
                         const uint32_t row = kb * in0_block_w_gu + k;
                         const uint32_t col = my_nt_gu * per_core_N_gu + n;
                         if (col < N_gate_tiles_full) {
-                            const uint32_t tile_idx = row * N_gate_tiles_full + col;
+                            const uint32_t tile_idx = gate_page_offset + row * N_gate_tiles_full + col;
                             noc_read.async_read(
                                 gate_acc,
                                 CoreLocalMem<uint32_t>(l1_w_gate),
@@ -642,7 +654,7 @@ void kernel_main() {
                             const uint32_t row = kb * in0_block_w_gu + k;
                             const uint32_t col = my_nt_gu * per_core_N_gu + n;
                             if (col < N_gate_tiles_full) {
-                                const uint32_t tile_idx = row * N_gate_tiles_full + col;
+                                const uint32_t tile_idx = up_page_offset + row * N_gate_tiles_full + col;
                                 noc_read.async_read(
                                     up_acc, CoreLocalMem<uint32_t>(l1_w_up), up_tile_bytes, {.page_id = tile_idx}, {});
                             } else {
@@ -800,7 +812,7 @@ void kernel_main() {
                         const uint32_t row = kb * in0_block_w_d + k;
                         const uint32_t col = my_nt_d * per_core_N_d + n;
                         if (row < K_down_tiles && col < N_down_tiles_full) {
-                            const uint32_t tile_idx = row * N_down_tiles_full + col;
+                            const uint32_t tile_idx = down_page_offset + row * N_down_tiles_full + col;
                             noc_read.async_read(
                                 down_acc, CoreLocalMem<uint32_t>(l1_w), down_tile_bytes, {.page_id = tile_idx}, {});
                         } else if (row >= K_down_tiles) {

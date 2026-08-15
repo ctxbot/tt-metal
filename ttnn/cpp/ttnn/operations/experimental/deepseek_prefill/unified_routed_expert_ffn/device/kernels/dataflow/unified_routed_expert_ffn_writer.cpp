@@ -63,6 +63,7 @@ void kernel_main() {
     // up_done = up landed.
     const uint32_t up_go_sem_id = get_arg_val<uint32_t>(7);
     const uint32_t up_done_sem_id = get_arg_val<uint32_t>(8);
+    const uint32_t up_page_offset = get_arg_val<uint32_t>(9);
 
     constexpr uint32_t cb_out = get_compile_time_arg_val(1);
     // per_core_M_max: CB-sized max per-core M. The runtime per_core_M is picked
@@ -214,7 +215,7 @@ void kernel_main() {
                             const uint32_t row = kb * in0_block_w_gu + k;
                             const uint32_t col = my_nt_gu * per_core_N_gu + n;
                             if (col < N_gate_tiles_full) {
-                                const uint32_t tile_idx = row * N_gate_tiles_full + col;
+                                const uint32_t tile_idx = up_page_offset + row * N_gate_tiles_full + col;
                                 noc_up.async_read(
                                     up_acc, CoreLocalMem<uint32_t>(l1_w_up), up_tile_bytes, {.page_id = tile_idx}, {});
                             } else {

@@ -86,7 +86,8 @@ ttnn::Tensor unified_routed_expert_ffn(
     // down matmul. Omit for the bias-free DeepSeek / MiniMax-M3 path.
     const std::optional<ttnn::Tensor>& gate_bias = std::nullopt,
     const std::optional<ttnn::Tensor>& up_bias = std::nullopt,
-    const std::optional<ttnn::Tensor>& down_bias = std::nullopt);
+    const std::optional<ttnn::Tensor>& down_bias = std::nullopt,
+    uint32_t packed_expert_count = 1);
 
 // MoE-level composite: takes the dispatched buffer + ALL local experts'
 // weights and loops over local experts in C++, calling
@@ -115,7 +116,13 @@ ttnn::Tensor unified_routed_expert_moe(
     // the bias-free DeepSeek / MiniMax-M3 path.
     const std::optional<std::vector<ttnn::Tensor>>& gate_biases = std::nullopt,
     const std::optional<std::vector<ttnn::Tensor>>& up_biases = std::nullopt,
-    const std::optional<std::vector<ttnn::Tensor>>& down_biases = std::nullopt);
+    const std::optional<std::vector<ttnn::Tensor>>& down_biases = std::nullopt,
+    // Versioned packed-cache path: one expert-major DRAM tensor per projection
+    // family. When all three are supplied, the three vector arguments must be
+    // empty and the composite derives the local expert count from idx_table.
+    const std::optional<ttnn::Tensor>& packed_gate_proj = std::nullopt,
+    const std::optional<ttnn::Tensor>& packed_up_proj = std::nullopt,
+    const std::optional<ttnn::Tensor>& packed_down_proj = std::nullopt);
 
 }  // namespace ttnn::operations::experimental::deepseek_prefill::unified_routed_expert_ffn
 

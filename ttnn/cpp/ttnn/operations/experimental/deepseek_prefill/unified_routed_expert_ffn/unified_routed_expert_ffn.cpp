@@ -28,7 +28,8 @@ ttnn::Tensor unified_routed_expert_ffn(
     RoutedExpertActivation activation,
     const std::optional<ttnn::Tensor>& gate_bias,
     const std::optional<ttnn::Tensor>& up_bias,
-    const std::optional<ttnn::Tensor>& down_bias) {
+    const std::optional<ttnn::Tensor>& down_bias,
+    uint32_t packed_expert_count) {
     // Single-op fused per-expert FFN. One device Program runs gate matmul,
     // up matmul, silu, multiply, down matmul as four phases inside the same
     // kernel. The kernel reads counts[global_expert_idx_table[local_expert_id]]
@@ -57,6 +58,7 @@ ttnn::Tensor unified_routed_expert_ffn(
         M_tiles_full,
         read_x_at_offset,
         x_is_row_major,
+        packed_expert_count,
         compute_kernel_config.has_value() ? std::optional<ttnn::DeviceComputeKernelConfig>(*compute_kernel_config)
                                           : std::nullopt,
         output,
@@ -80,14 +82,29 @@ ttnn::Tensor unified_routed_expert_moe(
     RoutedExpertActivation activation,
     const std::optional<std::vector<ttnn::Tensor>>& gate_biases,
     const std::optional<std::vector<ttnn::Tensor>>& up_biases,
-    const std::optional<std::vector<ttnn::Tensor>>& down_biases) {
+    const std::optional<std::vector<ttnn::Tensor>>& down_biases,
+    const std::optional<ttnn::Tensor>& packed_gate_proj,
+    const std::optional<ttnn::Tensor>& packed_up_proj,
+    const std::optional<ttnn::Tensor>& packed_down_proj) {
+    const int packed_count = static_cast<int>(packed_gate_proj.has_value()) +
+                             static_cast<int>(packed_up_proj.has_value()) +
+                             static_cast<int>(packed_down_proj.has_value());
+    TT_FATAL(
+        packed_count == 0 || packed_count == 3,
+        "packed gate/up/down projections must all be provided together or all omitted (got {} of 3)",
+        packed_count);
+    const bool has_packed = packed_count == 3;
     TT_FATAL(
         gate_projs.size() == up_projs.size() && gate_projs.size() == down_projs.size(),
         "gate/up/down projection lists must have the same length (got {}, {}, {})",
         gate_projs.size(),
         up_projs.size(),
         down_projs.size());
-    const uint32_t experts_per_chip = static_cast<uint32_t>(gate_projs.size());
+    TT_FATAL(
+        !has_packed || gate_projs.empty(),
+        "packed routed-expert path does not accept legacy gate/up/down tensor lists");
+    const uint32_t experts_per_chip = has_packed ? static_cast<uint32_t>(global_expert_idx_table.logical_shape()[-1])
+                                                 : static_cast<uint32_t>(gate_projs.size());
     TT_FATAL(experts_per_chip > 0, "Need at least one expert per chip");
 
     // Optional per-expert biases (gpt-oss): all three lists together or none,
@@ -109,6 +126,7 @@ ttnn::Tensor unified_routed_expert_moe(
             up_biases->size(),
             down_biases->size());
     }
+    TT_FATAL(!has_packed || !has_bias, "packed routed-expert path does not yet support per-expert biases");
 
     // Per-expert composite: run the unified FFN on each expert's slice of the
     // dispatched buffer at that expert's region offset (read_x_at_offset for the
@@ -147,9 +165,9 @@ ttnn::Tensor unified_routed_expert_moe(
     for (uint32_t local_expert = 0; local_expert < experts_per_chip; ++local_expert) {
         unified_routed_expert_ffn(
             dispatched_buffer,
-            gate_projs[local_expert],
-            up_projs[local_expert],
-            down_projs[local_expert],
+            has_packed ? *packed_gate_proj : gate_projs[local_expert],
+            has_packed ? *packed_up_proj : up_projs[local_expert],
+            has_packed ? *packed_down_proj : down_projs[local_expert],
             expert_token_counts,
             global_expert_idx_table,
             local_expert,
@@ -162,7 +180,8 @@ ttnn::Tensor unified_routed_expert_moe(
             activation,
             has_bias ? std::optional<ttnn::Tensor>((*gate_biases)[local_expert]) : std::nullopt,
             has_bias ? std::optional<ttnn::Tensor>((*up_biases)[local_expert]) : std::nullopt,
-            has_bias ? std::optional<ttnn::Tensor>((*down_biases)[local_expert]) : std::nullopt);
+            has_bias ? std::optional<ttnn::Tensor>((*down_biases)[local_expert]) : std::nullopt,
+            has_packed ? experts_per_chip : 1);
     }
     return output;
 }

@@ -115,7 +115,8 @@ void bind_unified_routed_expert_ffn(nb::module_& mod) {
         nb::arg("activation") = RoutedExpertActivation::Silu,
         nb::arg("gate_bias") = nb::none(),
         nb::arg("up_bias") = nb::none(),
-        nb::arg("down_bias") = nb::none());
+        nb::arg("down_bias") = nb::none(),
+        nb::arg("packed_expert_count") = 1);
 
     ttnn::bind_function<"unified_routed_expert_moe", "ttnn.experimental.deepseek_prefill.">(
         mod,
@@ -170,7 +171,10 @@ void bind_unified_routed_expert_ffn(nb::module_& mod) {
         nb::arg("activation") = RoutedExpertActivation::Silu,
         nb::arg("gate_biases") = nb::none(),
         nb::arg("up_biases") = nb::none(),
-        nb::arg("down_biases") = nb::none());
+        nb::arg("down_biases") = nb::none(),
+        nb::arg("packed_gate_proj") = nb::none(),
+        nb::arg("packed_up_proj") = nb::none(),
+        nb::arg("packed_down_proj") = nb::none());
 }
 
 }  // namespace ttnn::operations::experimental::deepseek_prefill::unified_routed_expert_ffn::detail

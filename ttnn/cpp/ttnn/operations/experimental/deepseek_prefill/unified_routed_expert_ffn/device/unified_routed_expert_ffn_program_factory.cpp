@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <unordered_map>
 #include <utility>
@@ -85,7 +86,7 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     const uint32_t M_tiles_full = op.m_tiles;
     const uint32_t K_gate_tiles = x_shape[-1] / TILE;            // = N_gate K = emb / TILE
     const uint32_t N_gate_tiles_full = gate_shape[-1] / TILE;    // = hidden / TILE
-    const uint32_t K_down_tiles = down_shape[-2] / TILE;         // = hidden / TILE
+    const uint32_t K_down_tiles = (down_shape[-2] / op.packed_expert_count) / TILE;  // = hidden / TILE
     const uint32_t N_down_tiles_full = down_shape[-1] / TILE;    // = emb / TILE
 
     // Blackhole compute grid is 13x10 worker cores; we use the bottom-left
@@ -388,6 +389,23 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     auto* counts_buffer = t.counts.buffer();
     auto* idx_buffer = t.global_expert_idx_table.buffer();
     auto* out_buffer = tensor_return_value.buffer();
+
+    // Packed tensors are expert-major along K. DRAM tensor pages are bank
+    // interleaved, so a byte-address shift is *not* a valid tensor view unless
+    // the stride happens to align with every bank. Keep the buffer base address
+    // and pass tile-page offsets to the dataflow kernels instead.
+    const uint64_t packed_expert_idx = op.packed_expert_count > 1 ? op.local_expert_id : 0;
+    const uint64_t gate_page_offset = packed_expert_idx * K_gate_tiles * N_gate_tiles_full;
+    const uint64_t up_page_offset = packed_expert_idx * K_gate_tiles * N_gate_tiles_full;
+    const uint64_t down_page_offset = packed_expert_idx * K_down_tiles * N_down_tiles_full;
+    TT_FATAL(
+        gate_page_offset <= std::numeric_limits<uint32_t>::max() &&
+            up_page_offset <= std::numeric_limits<uint32_t>::max() &&
+            down_page_offset <= std::numeric_limits<uint32_t>::max(),
+        "packed routed-expert tile-page offset exceeds 32-bit range");
+    const uint32_t gate_addr = gate_buffer->address();
+    const uint32_t up_addr = up_buffer->address();
+    const uint32_t down_addr = down_buffer->address();
 
     // Direct-write mode: when expert_region_offsets is supplied, the writer
     // writes this expert's output straight into the shared output buffer at
@@ -933,9 +951,9 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         //     read_x_at_offset, else points at out_buffer and is unread)
         std::vector<uint32_t> reader_args = {
             x_buffer->address(),
-            gate_buffer->address(),
-            up_buffer->address(),
-            down_buffer->address(),
+            gate_addr,
+            up_addr,
+            down_addr,
             counts_buffer->address(),
             idx_buffer->address(),
             my_mt,
@@ -987,6 +1005,9 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
             reader_args.push_back(t.up_bias->buffer()->address());
             reader_args.push_back(t.down_bias->buffer()->address());
         }
+        reader_args.push_back(static_cast<uint32_t>(gate_page_offset));
+        reader_args.push_back(static_cast<uint32_t>(up_page_offset));
+        reader_args.push_back(static_cast<uint32_t>(down_page_offset));
         tt::tt_metal::SetRuntimeArgs(program, reader_kernel_id, core, reader_args);
 
         // Writer runtime arg layout (must match unified_routed_expert_ffn_writer.cpp):
@@ -996,15 +1017,16 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         //   4: up_addr  5: my_nt_gu  6: is_up_sender (gy==0)
         //   7: up_go_sem_id  8: up_done_sem_id  (UP_SPLIT local same-core handshake)
         std::vector<uint32_t> writer_args = {
-            out_buffer->address(),                 // 0
-            my_mt,                                 // 1
-            my_nt_d,                               // 2
-            start_buffer->address(),               // 3
-            up_buffer->address(),                  // 4
-            my_nt_gu,                              // 5
-            static_cast<uint32_t>(is_in1_sender),  // 6 is_up_sender
-            up_go_sem_id,                          // 7
-            up_done_sem_id,                        // 8
+            out_buffer->address(),                  // 0
+            my_mt,                                  // 1
+            my_nt_d,                                // 2
+            start_buffer->address(),                // 3
+            up_addr,                                // 4
+            my_nt_gu,                               // 5
+            static_cast<uint32_t>(is_in1_sender),   // 6 is_up_sender
+            up_go_sem_id,                           // 7
+            up_done_sem_id,                         // 8
+            static_cast<uint32_t>(up_page_offset),  // 9
         };
         tt::tt_metal::SetRuntimeArgs(program, writer_kernel_id, core, writer_args);
     }
@@ -1020,7 +1042,7 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
 
 void UnifiedRoutedExpertFfnProgramFactory::override_runtime_arguments(
     cached_program_t& cached_program,
-    const UnifiedRoutedExpertFfnParams& /*op*/,
+    const UnifiedRoutedExpertFfnParams& op,
     const UnifiedRoutedExpertFfnInputs& t,
     Tensor& tensor_return_value) {
     auto& program = cached_program.program;
@@ -1029,6 +1051,19 @@ void UnifiedRoutedExpertFfnProgramFactory::override_runtime_arguments(
     const auto& cores = cached_program.shared_variables.cores;
 
     const uint32_t x_addr = t.x.buffer()->address();
+    const uint32_t packed_expert_idx = op.packed_expert_count > 1 ? op.local_expert_id : 0;
+    const uint32_t gate_k_tiles = (t.gate_proj.padded_shape()[-2] / op.packed_expert_count) / TILE;
+    const uint32_t gate_n_tiles = t.gate_proj.padded_shape()[-1] / TILE;
+    const uint32_t down_k_tiles = (t.down_proj.padded_shape()[-2] / op.packed_expert_count) / TILE;
+    const uint32_t down_n_tiles = t.down_proj.padded_shape()[-1] / TILE;
+    const uint64_t gate_page_offset = static_cast<uint64_t>(packed_expert_idx) * gate_k_tiles * gate_n_tiles;
+    const uint64_t up_page_offset = static_cast<uint64_t>(packed_expert_idx) * gate_k_tiles * gate_n_tiles;
+    const uint64_t down_page_offset = static_cast<uint64_t>(packed_expert_idx) * down_k_tiles * down_n_tiles;
+    TT_FATAL(
+        gate_page_offset <= std::numeric_limits<uint32_t>::max() &&
+            up_page_offset <= std::numeric_limits<uint32_t>::max() &&
+            down_page_offset <= std::numeric_limits<uint32_t>::max(),
+        "packed routed-expert tile-page offset exceeds 32-bit range");
     const uint32_t gate_addr = t.gate_proj.buffer()->address();
     const uint32_t up_addr = t.up_proj.buffer()->address();
     const uint32_t down_addr = t.down_proj.buffer()->address();
@@ -1049,19 +1084,24 @@ void UnifiedRoutedExpertFfnProgramFactory::override_runtime_arguments(
         reader_args[3] = down_addr;
         reader_args[4] = counts_addr;
         reader_args[5] = idx_addr;
-        // start_addr sits before the (optional) 3 trailing bias addrs.
-        const size_t start_idx = reader_args.size() - 1 - (has_bias ? 3 : 0);
+        // The three trailing entries are packed page offsets; start sits before
+        // those and before the optional three bias addresses.
+        const size_t start_idx = reader_args.size() - 4 - (has_bias ? 3 : 0);
         reader_args[start_idx] = start_addr;
         if (has_bias) {
-            reader_args[reader_args.size() - 3] = t.gate_bias->buffer()->address();
-            reader_args[reader_args.size() - 2] = t.up_bias->buffer()->address();
-            reader_args[reader_args.size() - 1] = t.down_bias->buffer()->address();
+            reader_args[reader_args.size() - 6] = t.gate_bias->buffer()->address();
+            reader_args[reader_args.size() - 5] = t.up_bias->buffer()->address();
+            reader_args[reader_args.size() - 4] = t.down_bias->buffer()->address();
         }
+        reader_args[reader_args.size() - 3] = static_cast<uint32_t>(gate_page_offset);
+        reader_args[reader_args.size() - 2] = static_cast<uint32_t>(up_page_offset);
+        reader_args[reader_args.size() - 1] = static_cast<uint32_t>(down_page_offset);
 
         auto& writer_args = tt::tt_metal::GetRuntimeArgs(program, writer_id, core);
         writer_args[0] = out_addr;
         writer_args[3] = start_addr;
         writer_args[4] = up_addr;  // two-RISC up-weight read base address
+        writer_args[9] = static_cast<uint32_t>(up_page_offset);
     }
 }
 
