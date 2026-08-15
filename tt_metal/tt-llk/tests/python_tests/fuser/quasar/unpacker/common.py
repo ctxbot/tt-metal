@@ -87,12 +87,6 @@ def configure_unpack(
     return _emit_configure(compute_node, dest_acc, new_A_dst, new_B_dst)
 
 
-def dvalid_init(quasar_use_dvalid: bool = False) -> str:
-    if quasar_use_dvalid:
-        return "set_up_dest_dvalid_per_thread<dest_dvalid_client::UNPACK>({dest_dvalid_client::FPU, dest_dvalid_client::PACK});\n"
-    return ""
-
-
 def sync_with_packer(config: "GlobalConfig", operation: "L1Operation") -> str:
     if operation.needs_pack_sync:
         return (

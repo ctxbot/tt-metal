@@ -226,7 +226,7 @@ class FusedKernelGenerator:
             )
 
         quasar_include = (
-            '#include "llk_sync.h"\n'
+            '#include "llk_dest_dvalid.h"\n#include "llk_sync.h"\n'
             if self.config.global_config.architecture == ChipArchitecture.QUASAR
             else '#include "operand.h"\n'
         )

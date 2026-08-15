@@ -18,6 +18,7 @@ unpack_common = importlib.import_module(f"fuser.{_ARCH_NAME}.unpacker.common")
 fpu_common = importlib.import_module(f"fuser.{_ARCH_NAME}.fpu.common")
 pack_common = importlib.import_module(f"fuser.{_ARCH_NAME}.packer.common")
 sfpu_common = importlib.import_module(f"fuser.{_ARCH_NAME}.sfpu.common")
+dest_dvalid = importlib.import_module(f"fuser.{_ARCH_NAME}.dest_dvalid")
 
 
 def _get_parser():

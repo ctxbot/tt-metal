@@ -12,14 +12,6 @@
 
 namespace ckernel
 {
-enum class dest_dvalid_client : std::uint32_t
-{
-    UNPACK = 0,
-    FPU    = 1,
-    SFPU   = 2,
-    PACK   = 3,
-};
-
 struct dest_dvalid_config
 {
     std::uint32_t ctrl_addr32;
@@ -29,8 +21,8 @@ struct dest_dvalid_config
 
 constexpr dest_dvalid_config dest_dvalid_configs[] = {
     {UNPACK_TO_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::UNPACK_TO_DEST, p_stall::UNPACK0},
-    {MATH_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::FPU, p_stall::NOTHING},
-    {SFPU_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::SFPU, p_stall::NOTHING},
+    {MATH_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::FPU, p_stall::MATH},
+    {SFPU_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::SFPU, p_stall::WAIT_SFPU},
     {PACK_DEST_DVALID_CTRL_wait_mask_ADDR32, p_cleardvalid::PACK, p_stall::PACK},
 };
 
@@ -110,7 +102,6 @@ inline void _llk_dest_dvalid_enable_()
 {
     constexpr dest_dvalid_config CFG = dest_dvalid_config_of<CLIENT>;
 
-    dest_dvalid_chain |= CFG.bit;
     dest_dvalid_wait_client_idle<CLIENT>();
 
     const bool is_first = dest_dvalid_lowest(dest_dvalid_chain) == CFG.bit;
@@ -135,7 +126,7 @@ inline void _llk_dest_dvalid_signal_()
 {
     constexpr dest_dvalid_config CFG = dest_dvalid_config_of<CLIENT>;
 
-    TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::NOTHING, p_stall::WAIT_SFPU, CFG.drain_res);
+    TTI_STALLWAIT(p_stall::STALL_MATH, p_stall::NOTHING, p_stall::NOTHING, CFG.drain_res);
 
     if constexpr (CLIENT == dest_dvalid_client::PACK)
     {
@@ -167,9 +158,7 @@ inline void _llk_dest_dvalid_disable_()
 {
     constexpr dest_dvalid_config CFG = dest_dvalid_config_of<CLIENT>;
 
-    dest_dvalid_chain &= ~CFG.bit;
-
-    TTI_STALLWAIT(p_stall::STALL_MATH | p_stall::STALL_CFG, p_stall::NOTHING, p_stall::WAIT_SFPU, CFG.drain_res);
+    TTI_STALLWAIT(p_stall::STALL_MATH | p_stall::STALL_CFG, p_stall::NOTHING, p_stall::NOTHING, CFG.drain_res);
     dest_dvalid_wait_client_idle<CLIENT>();
     TTI_CLEARDVALID(0, 0, 0, CFG.bit, 0, 0);
     cfg_rmw(CFG.ctrl_addr32, 0, DEST_DVALID_CTRL_MASK, 0);

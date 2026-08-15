@@ -4,6 +4,7 @@
 
 from typing import TYPE_CHECKING
 
+from fuser.quasar import dest_dvalid
 from helpers.llk_params import DestSync
 
 if TYPE_CHECKING:
@@ -20,7 +21,7 @@ def sfpu_on_isolated_trisc(config: "GlobalConfig") -> bool:
 
 
 def math_handoff_to_sfpu(config: "GlobalConfig", operation: "L1Operation") -> str:
-    if config.skip_sync:
+    if config.skip_sync or config.quasar_use_dvalid:
         return ""
     return (
         "_llk_sync_post_<p_stall::MATH>(semaphore::FPU_SFPU);\n"
@@ -30,7 +31,7 @@ def math_handoff_to_sfpu(config: "GlobalConfig", operation: "L1Operation") -> st
 
 
 def sfpu_wait_for_math(config: "GlobalConfig", operation: "L1Operation") -> str:
-    if config.skip_sync:
+    if config.skip_sync or config.quasar_use_dvalid:
         return ""
     return (
         f"_llk_sync_wait_<{_SFPU_WAIT_STALL}, p_stall::STALL_ON_ZERO>(semaphore::FPU_SFPU);\n"
@@ -39,12 +40,14 @@ def sfpu_wait_for_math(config: "GlobalConfig", operation: "L1Operation") -> str:
 
 
 def sfpu_signal_math(config: "GlobalConfig", operation: "L1Operation") -> str:
-    if config.skip_sync:
+    if config.skip_sync or config.quasar_use_dvalid:
         return ""
     return "_llk_sync_post_<p_stall::WAIT_SFPU>(semaphore::SFPU_FPU);\n"
 
 
 def sfpu_sync_init(config: "GlobalConfig", operation: "L1Operation") -> str:
+    if config.quasar_use_dvalid:
+        return dest_dvalid.enable(config, operation, dest_dvalid.SFPU)
     if operation.stage_id != 1:
         return ""
     return (
@@ -54,6 +57,8 @@ def sfpu_sync_init(config: "GlobalConfig", operation: "L1Operation") -> str:
 
 
 def sfpu_dest_section_done(config: "GlobalConfig", operation: "L1Operation") -> str:
+    if config.quasar_use_dvalid:
+        return dest_dvalid.signal(config, operation, dest_dvalid.SFPU)
     if config.skip_sync or operation.dest_sync != DestSync.Half:
         return ""
     dest_acc = config.dest_acc.cpp_enum_value

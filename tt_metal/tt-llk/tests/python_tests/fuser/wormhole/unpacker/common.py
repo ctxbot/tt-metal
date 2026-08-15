@@ -128,10 +128,6 @@ def configure_unpack(
     return code
 
 
-def dvalid_init(**kwargs) -> str:
-    return ""
-
-
 def sync_with_packer(config: "GlobalConfig", operation: "L1Operation") -> str:
     if operation.needs_pack_sync:
         return (

@@ -12,7 +12,13 @@ if TYPE_CHECKING:
 
 from helpers.llk_params import GoldenType
 
-from .arch_common import fpu_common, pack_common, sfpu_common, unpack_common
+from .arch_common import (
+    dest_dvalid,
+    fpu_common,
+    pack_common,
+    sfpu_common,
+    unpack_common,
+)
 from .base_fpu import Fpu
 from .base_sfpu import Sfpu
 from .base_unpacker import Unpacker
@@ -215,9 +221,7 @@ class ComputePipeline:
         hoist_reconfig = hoist or self._all_same_operand_formats(unpack_ops)
 
         init_code = ""
-        init_code += unpack_common.dvalid_init(
-            quasar_use_dvalid=config.quasar_use_dvalid
-        )
+        init_code += dest_dvalid.enable(config, operation, dest_dvalid.UNPACK)
         init_code += config.sentinel.hw_configure_unpack(config, operation)
         if hoist_reconfig and unpack_ops and not config.skip_unpack_init:
             init_code += config.sentinel.configure_unpack(
@@ -253,6 +257,8 @@ class ComputePipeline:
                 body += cu.unpack_run(operation, config, block)
                 if not hoist:
                     body += cu.unpack_uninit(operation, config, block)
+                if cu.unpack_to_dest.value:
+                    body += dest_dvalid.signal(config, operation, dest_dvalid.UNPACK)
             return body
 
         code += self._zone_loop(
@@ -264,6 +270,7 @@ class ComputePipeline:
         uninit_code = ""
         if hoist and not unpack_ops[0].unpacker.per_block_init:
             uninit_code += unpack_ops[0].unpack_uninit(operation, config, None)
+        uninit_code += dest_dvalid.disable(config, operation, dest_dvalid.UNPACK)
         code += self._zone(config, "INIT", uninit_code)
 
         return code
@@ -327,6 +334,7 @@ class ComputePipeline:
         uninit_code = ""
         if hoist and not fpu_ops[0].fpu.per_block_init:
             uninit_code += fpu_ops[0].fpu_uninit(operation, config, None)
+        uninit_code += dest_dvalid.disable(config, operation, dest_dvalid.FPU)
         code += self._zone(config, "INIT", uninit_code)
 
         return code
@@ -353,6 +361,9 @@ class ComputePipeline:
 
         code += self._zone_loop(
             config, "TILE_LOOP", self._batch_loop(operation, config, batch_body)
+        )
+        code += self._zone(
+            config, "INIT", dest_dvalid.disable(config, operation, dest_dvalid.SFPU)
         )
 
         return code
@@ -422,6 +433,7 @@ class ComputePipeline:
         if hoist and not pack_only[0].packer.per_block_init:
             uninit_code += pack_only[0].uninit(operation, config)
         uninit_code += pack_common.pack_reduce_mask_clear(operation)
+        uninit_code += dest_dvalid.disable(config, operation, dest_dvalid.PACK)
         code += self._zone(config, "INIT", uninit_code)
 
         return code
