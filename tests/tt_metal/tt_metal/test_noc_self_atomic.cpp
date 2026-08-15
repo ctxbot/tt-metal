@@ -45,6 +45,8 @@ protected:
     const std::string kernel_path_noc = "tests/tt_metal/tt_metal/test_kernels/dataflow/noc_self_atomic.cpp";
     const std::string kernel_path_amo32 = "tests/tt_metal/tt_metal/test_kernels/dataflow/dm_amo32.cpp";
     const std::string kernel_path_cas32 = "tests/tt_metal/tt_metal/test_kernels/dataflow/dm_cas32.cpp";
+    const std::string kernel_path_inline_write =
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/noc_inline_write_probe.cpp";
     const std::string kernel_path_cacheline = "tests/tt_metal/tt_metal/test_kernels/dataflow/dm_cacheline_probe.cpp";
     const std::string kernel_path_cas_drain = "tests/tt_metal/tt_metal/test_kernels/dataflow/noc_self_cas_drain.cpp";
     uint32_t l1_unreserved_base{0};
@@ -590,6 +592,96 @@ TEST_F(NocSelfAtomicFixture, TestSelfCasLockVsIncr) {
     EXPECT_EQ(observed, 0u)
         << "CAS and INCR_GET did not serialize mutually at the NIU: a locked decrement raced a plain "
            "producer increment -- EXTERNAL multi-consumer down() cannot coexist with up().";
+}
+
+// CHARACTERIZATION (gap-8 prerequisite): posted noc_inline_dw_write from a Quasar DM kernel to
+// a REMOTE core's L1. The non-posted variant is KNOWN to wedge on this RTL (watcher: hart parked
+// at NWIW, 2026-08-14) and is not exercised. A same-route non-posted marker write is barriered
+// after the posted writes, so its arrival proves the posted writes are not merely in flight:
+//   words[0] == 0xC0DE0001  -> a single posted inline write lands (V1)
+//   words[1] == 64          -> 64 ascending posted writes land IN ORDER, last wins (V2)
+//   words[4] == 0x4ACCED11  -> the marker (proven primitive) landed -- run validity check
+//   words[2,3,5,6,7] == prefill -> no byte-enable spill onto neighbours
+// CHARACTERIZED 2026-08-14, DISABLED: the posted variant WEDGES exactly like the non-posted one
+// -- watcher shows the hart parked at NWIW inside the call on its FIRST write (identical
+// signature both variants; see generated/watcher/watcher.log traces). noc_inline_dw_write is
+// therefore unusable from Quasar DM kernels on this RTL in any form; gap-8's REMOTE_POSTED
+// delivers its staged count with plain noc_async_write instead (the write_cmd_buf route -- the
+// only proven one; noc_semaphore_set_remote wedges too, at NSSW). Kept DISABLED as the minimal
+// RTL repro
+// (mirrors the DISABLED lane-2 CAS anomaly pattern); re-enable to re-characterize on new RTL.
+TEST_F(NocSelfAtomicFixture, DISABLED_TestInlineDwWritePostedFromDmCharacterization) {
+    const auto grid = mesh_device_->compute_with_storage_grid_size();
+    if (grid.x < 2 && grid.y < 2) {
+        GTEST_SKIP() << "Requires >= 2 worker nodes for a genuinely-remote writer";
+    }
+    if (!is_quasar) {
+        GTEST_SKIP() << "Quasar RTL characterization only";
+    }
+    const experimental::NodeCoord node_0{0, 0};
+    const experimental::NodeCoord node_1 =
+        (grid.x >= 2) ? experimental::NodeCoord{1, 0} : experimental::NodeCoord{0, 1};
+
+    // Prefill 8 words on the TARGET node with a canary; the probe must overwrite exactly 0/1/4.
+    const uint32_t kCanary = 0xAB0DE000u;
+    std::vector<uint32_t> prefill(8, kCanary);
+    tt::tt_metal::detail::WriteToDeviceL1(mesh_device_->get_devices()[0], node_0, l1_unreserved_base, prefill);
+
+    const CoreCoord node_0_virtual = mesh_device_->worker_core_from_logical_core(node_0);
+
+    distributed::MeshWorkload workload;
+    Program program;
+    distributed::MeshCoordinate zero_coord{0, 0};
+    distributed::MeshCoordinateRange device_range{zero_coord, zero_coord};
+
+    const experimental::KernelSpecName WRITER{"inline_write_probe"};
+    experimental::KernelSpec writer_spec{
+        .unique_id = WRITER,
+        .source = kernel_path_inline_write,
+        .num_threads = 1,
+        .runtime_arg_schema = {.runtime_arg_names = {"base_addr", "remote_noc_x", "remote_noc_y"}},
+        .hw_config = experimental::DataMovementGen2Config{},
+    };
+    experimental::WorkUnitSpec wu{.name = "wu", .kernels = {WRITER}, .target_nodes = node_1};
+    experimental::ProgramSpec spec{.name = "inline_write_probe", .kernels = {writer_spec}, .work_units = {wu}};
+    program = experimental::MakeProgramFromSpec(*mesh_device_, spec);
+
+    experimental::ProgramRunArgs params;
+    params.kernel_run_args = {
+        experimental::ProgramRunArgs::KernelRunArgs{
+            .kernel = WRITER,
+            .runtime_arg_values = experimental::MakeRuntimeArgsForSingleNode(
+                node_1,
+                {{"base_addr", l1_unreserved_base},
+                 {"remote_noc_x", static_cast<uint32_t>(node_0_virtual.x)},
+                 {"remote_noc_y", static_cast<uint32_t>(node_0_virtual.y)}}),
+        },
+    };
+    experimental::SetProgramRunArgs(program, params);
+    workload.add_program(device_range, std::move(program));
+    RunProgram(mesh_device_, workload);
+
+    std::vector<uint32_t> words;
+    tt::tt_metal::detail::ReadFromDeviceL1(
+        mesh_device_->get_devices()[0], node_0, l1_unreserved_base, 8 * sizeof(uint32_t), words);
+    ASSERT_EQ(words.size(), 8u);
+    log_info(
+        LogTest,
+        "inline-dw characterization: v1={:#x} v2={} marker={:#x} canaries={:#x},{:#x},{:#x},{:#x},{:#x}",
+        words[0],
+        words[1],
+        words[4],
+        words[2],
+        words[3],
+        words[5],
+        words[6],
+        words[7]);
+    ASSERT_EQ(words[4], 0x4ACCED11u) << "marker (proven non-posted write) missing: run invalid";
+    EXPECT_EQ(words[0], 0xC0DE0001u) << "posted inline write DROPPED (V1)";
+    EXPECT_EQ(words[1], 64u) << "posted inline writes lost/reordered (V2: last value must win)";
+    for (int i : {2, 3, 5, 6, 7}) {
+        EXPECT_EQ(words[i], kCanary) << "byte-enable spill onto word " << i;
+    }
 }
 
 }  // namespace tt::tt_metal

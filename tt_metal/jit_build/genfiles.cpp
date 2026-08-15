@@ -105,7 +105,10 @@ void write_file(const string& path, const string& content) {
 // Legacy kernels (created via CreateKernel) do not get kernel_bindings_generated.h.
 // Returns true if the kernel binds >= 1 DM_LOCAL_CACHED semaphore (so sem::init_dm_cached() was
 // emitted and its call must be auto-injected at kernel entry on the data-movement path).
-bool write_kernel_bindings_generated_header(const string& out_dir, const JitBuildSettings& settings) {
+// `out_has_posted_sem` (optional): set true if the kernel bakes >= 1 REMOTE_POSTED binding, so
+// the data-movement wrapper can auto-inject the posted exit drain.
+bool write_kernel_bindings_generated_header(
+    const string& out_dir, const JitBuildSettings& settings, bool* out_has_posted_sem = nullptr) {
     const string path = out_dir + "kernel_bindings_generated.h";
 
     // Get the DFB bindings from the settings callback
@@ -128,6 +131,10 @@ bool write_kernel_bindings_generated_header(const string& out_dir, const JitBuil
     // Returned so the caller can auto-inject the init call (see jit_build_genfiles_kernel_include).
     const bool has_cached_sem = std::any_of(
         sem_entries.begin(), sem_entries.end(), [](const auto& e) { return e.scope == SemScope::DM_LOCAL_CACHED; });
+    if (out_has_posted_sem != nullptr) {
+        *out_has_posted_sem = std::any_of(
+            sem_entries.begin(), sem_entries.end(), [](const auto& e) { return e.scope == SemScope::REMOTE_POSTED; });
+    }
 
     // Get the tensor binding handles from the settings callback
     // Tensor bindings come from a std::vector populated in user-specified order, so no sort is needed here.
@@ -163,6 +170,18 @@ bool write_kernel_bindings_generated_header(const string& out_dir, const JitBuil
     //    the host-resolved mechanism travels separately in the TT_METAL2_SEM_SCOPE_TABLE define.
     //  - TensorBindings are emitted into the tensor namespace
     //  - Scratchpad binding tokens are emitted into the scratch namespace
+    //
+    // NOTE: DFB tokens and semaphore ids are emitted as constexpr variables, i.e. as implicit CTAs.
+    //       This is a design decision; we could alternatively emit them as implicit CRTAs.
+    //       (Or, we could give the user the choice via the Metal 2.0 host API, on a per-kernel or per-binding basis.)
+    //       Implicit CTA is simpler and cheaper, but could theoretically cause unnecessary kernel cache hit misses.
+    //       We are starting simple and can adjust later if problems arise.
+    //       Legacy kernels passed semaphores both ways, kernel folks think this was more random than intentional.
+    //
+    //       TensorBindings are the first binding category to use implicit CRTAs (for the tensor base address).
+    //       Each binding's tensor base address is specified per-enqueue, from the corresponding TensorArgument.
+    //       The static layout tensor metadata (rank, shape, bank coords, etc.) comes in through positional CTAs,
+    //       added automatically by the Metal 2.0 host API machinery.
     ostringstream content;
     content << "// AUTO-GENERATED — do not edit.\n\n"
                "#pragma once\n\n";
@@ -566,8 +585,9 @@ void jit_build_genfiles_kernel_include(
     const bool is_metal2 = settings.is_metal2_kernel();
     string kernel_header_content;
     bool has_cached_sem = false;
+    bool has_posted_sem = false;
     if (is_metal2) {
-        has_cached_sem = write_kernel_bindings_generated_header(out_dir, settings);
+        has_cached_sem = write_kernel_bindings_generated_header(out_dir, settings, &has_posted_sem);
         write_kernel_args_generated_header(out_dir, settings);
         kernel_header_content =
             string("#include \"kernel_bindings_generated.h\"\n#include \"kernel_args_generated.h\"\n");
@@ -581,14 +601,19 @@ void jit_build_genfiles_kernel_include(
     }
     ////////////////////////////////////////////////////////////
 
-    // AUTO-INJECT the cached-semaphore pool stubs: rename the kernel's entry point and define the
-    // real kernel_main() as a wrapper that calls sem::init_dm_cached() first (a kernel can never
-    // read an unseeded pool word) and sem::finish_dm_cached() last (the final binder hart
-    // self-restores the pool row for the next program). Covers hand-written kernel_main() and
-    // the TT_KERNEL shim.
+    // AUTO-INJECT the semaphore entry/exit stubs: rename the kernel's entry point and define the
+    // real kernel_main() as a wrapper. Cached bindings get sem::init_dm_cached() first (a kernel
+    // can never read an unseeded pool word) and sem::finish_dm_cached() last (the final binder
+    // hart self-restores the pool row for the next program). A REMOTE_POSTED binding gets an
+    // exit noc_async_write_barrier(): the posted arm's per-call flush waits only for DEPARTURE
+    // (that is what frees the staging slot), so the LAST staged write's ack can still be in
+    // flight at user-code exit -- drain it here so the next launch's cmd-buf reset can never
+    // meet a stale ack, keeping the mechanism invisible (user code owes no barrier). Covers
+    // hand-written kernel_main() and the TT_KERNEL shim.
     // No leading underscore: global-scope identifiers starting with _ are reserved ([lex.name]).
     static constexpr const char* kUserEntry = "tt_dm_cached_user_kernel_main_";
-    if (has_cached_sem) {
+    const bool wrap_kernel_main = has_cached_sem || has_posted_sem;
+    if (wrap_kernel_main) {
         kernel_header_content += string("#define kernel_main ") + kUserEntry + "\n";
     }
 
@@ -599,10 +624,19 @@ void jit_build_genfiles_kernel_include(
     // and the args:: header (emitted above for Metal 2.0). Empty for legacy kernels.
     kernel_header_content += generate_tt_kernel_shim_if_present(settings, kernel_src, is_metal2);
 
-    if (has_cached_sem) {
-        kernel_header_content +=
-            string("\n#undef kernel_main\nvoid kernel_main() {\n    sem::init_dm_cached();\n    ") + kUserEntry +
-            "();\n    sem::finish_dm_cached();\n}\n";
+    if (wrap_kernel_main) {
+        kernel_header_content += "\n#undef kernel_main\nvoid kernel_main() {\n";
+        if (has_cached_sem) {
+            kernel_header_content += "    sem::init_dm_cached();\n";
+        }
+        kernel_header_content += string("    ") + kUserEntry + "();\n";
+        if (has_posted_sem) {
+            kernel_header_content += "    noc_async_write_barrier();  // REMOTE_POSTED exit drain\n";
+        }
+        if (has_cached_sem) {
+            kernel_header_content += "    sem::finish_dm_cached();\n";
+        }
+        kernel_header_content += "}\n";
     }
 
     string kernel_header = out_dir + "kernel_includes.hpp";

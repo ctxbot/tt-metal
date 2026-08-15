@@ -319,7 +319,24 @@ std::string StripCommentsForSemScan(const std::string& text) {
             in_str = true;
             continue;
         }
-        if (c == '\'' && (out.empty() || !std::isalnum(static_cast<unsigned char>(out.back())))) {
+        // Char-literal entry. The alnum look-back skips digit separators (1'000, 0xAB'CD), but an
+        // ENCODING PREFIX (L'x', u'x', U'x', u8'x') is alnum too and its literal may contain a '"'
+        // that would spuriously open string mode and swallow the rest of the line -- the unsafe
+        // direction. Recognize a standalone prefix (not part of a longer identifier) explicitly.
+        const auto is_encoding_prefix = [&]() {
+            const size_t n = out.size();
+            if (n >= 1 && (out[n - 1] == 'L' || out[n - 1] == 'u' || out[n - 1] == 'U') &&
+                (n == 1 || (!std::isalnum(static_cast<unsigned char>(out[n - 2])) && out[n - 2] != '_'))) {
+                return true;
+            }
+            if (n >= 2 && out[n - 1] == '8' && out[n - 2] == 'u' &&
+                (n == 2 || (!std::isalnum(static_cast<unsigned char>(out[n - 3])) && out[n - 3] != '_'))) {
+                return true;
+            }
+            return false;
+        };
+        if (c == '\'' &&
+            (out.empty() || !std::isalnum(static_cast<unsigned char>(out.back())) || is_encoding_prefix())) {
             in_chr = true;
             continue;
         }
@@ -328,9 +345,12 @@ std::string StripCommentsForSemScan(const std::string& text) {
     return out;
 }
 
-std::optional<std::string> ReadKernelSourceText(const KernelSpec& kernel_spec) {
+// `resolved_dir` (optional out): the directory of the file actually read, for the quoted-include
+// shadow check in KernelIncludesAreScannable; left empty for inline SourceCode kernels.
+std::optional<std::string> ReadKernelSourceText(
+    const KernelSpec& kernel_spec, std::filesystem::path* resolved_dir = nullptr) {
     return std::visit(
-        [](const auto& src) -> std::optional<std::string> {
+        [resolved_dir](const auto& src) -> std::optional<std::string> {
             using T = std::decay_t<decltype(src)>;
             if constexpr (std::is_same_v<T, KernelSpec::SourceCode>) {
                 return src.code;
@@ -357,6 +377,9 @@ std::optional<std::string> ReadKernelSourceText(const KernelSpec& kernel_spec) {
                     std::ifstream f(p);
                     if (!f) {
                         return std::nullopt;
+                    }
+                    if (resolved_dir != nullptr) {
+                        *resolved_dir = p.parent_path();
                     }
                     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
                 }
@@ -515,9 +538,12 @@ SemAccessClass ScanSemaphoreAccess(const std::string& stripped, const std::strin
                     }
                     q++;
                 }
-                if (commas >= 3) {
+                if (commas == 3) {  // exactly up(noc, x, y, v): the pinned-channel remote form
                     any_remote_up = true;
                     continue;
+                }
+                if (commas > 3) {
+                    return SemAccessClass::WRITER;  // explicit-vc remote up: channel not pinned
                 }
                 any_local_write = true;  // plain-local up()
                 continue;
@@ -540,24 +566,156 @@ SemAccessClass ScanSemaphoreAccess(const std::string& stripped, const std::strin
     return SemAccessClass::READ_ONLY;
 }
 
+// REMOTE_POSTED keeps the running count in the kernel's Semaphore OBJECT, so the bake is only
+// sound if the object is constructed exactly once per launch -- a construction inside a loop
+// (or a helper called twice) would restart the count and strand the receiver. Textual proof on
+// the stripped source: exactly one construction site, and it sits in STRAIGHT-LINE code at the
+// top of kernel_main() -- after kernel_main's opening brace with no intervening brace or
+// control-flow keyword, so it cannot be inside a loop, branch, lambda, or earlier helper.
+// Anything not provable returns false (the semaphore just stays EXTERNAL).
+bool ProvesSingleTopLevelConstruction(const std::string& stripped, const std::string& accessor) {
+    const std::string token = "sem::" + accessor;
+    size_t construction_pos = std::string::npos;
+    for (size_t pos = stripped.find(token); pos != std::string::npos; pos = stripped.find(token, pos + 1)) {
+        if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
+            (pos + token.size() < stripped.size() && IsIdentChar(stripped[pos + token.size()]))) {
+            continue;  // substring of a longer name (the scan validated these already)
+        }
+        // A construction site is `var (sem::acc` / `var {sem::acc`; the only other occurrence
+        // form the scan admits is sem_scope_of(sem::acc), which is not a construction.
+        size_t b = pos;
+        while (b > 0 && std::isspace(static_cast<unsigned char>(stripped[b - 1]))) {
+            b--;
+        }
+        if (b == 0 || (stripped[b - 1] != '(' && stripped[b - 1] != '{')) {
+            continue;
+        }
+        size_t e = b - 1;
+        while (e > 0 && std::isspace(static_cast<unsigned char>(stripped[e - 1]))) {
+            e--;
+        }
+        size_t id_beg = e;
+        while (id_beg > 0 && IsIdentChar(stripped[id_beg - 1])) {
+            id_beg--;
+        }
+        if (stripped.substr(id_beg, e - id_beg) == "sem_scope_of") {
+            continue;
+        }
+        if (construction_pos != std::string::npos) {
+            return false;  // second construction site
+        }
+        construction_pos = pos;
+    }
+    if (construction_pos == std::string::npos) {
+        return false;
+    }
+    // Anchor on the kernel_main() DEFINITION -- and only if it is unambiguous: exactly one
+    // word-bounded occurrence in the whole text (a forward declaration, a recursive call, or any
+    // expression reference makes the anchor -- and re-entry -- unprovable), preceded by `void`.
+    size_t main_pos = std::string::npos;
+    const std::string kmain = "kernel_main";
+    for (size_t pos = stripped.find(kmain); pos != std::string::npos; pos = stripped.find(kmain, pos + 1)) {
+        if ((pos > 0 && IsIdentChar(stripped[pos - 1])) ||
+            (pos + kmain.size() < stripped.size() && IsIdentChar(stripped[pos + kmain.size()]))) {
+            continue;
+        }
+        if (main_pos != std::string::npos) {
+            return false;  // second occurrence: declaration/call/recursion -- not provable
+        }
+        main_pos = pos;
+    }
+    if (main_pos == std::string::npos || main_pos > construction_pos) {
+        return false;  // constructed before kernel_main: a helper or a global -- not provable
+    }
+    size_t rt = main_pos;
+    while (rt > 0 && std::isspace(static_cast<unsigned char>(stripped[rt - 1]))) {
+        rt--;
+    }
+    size_t rt_beg = rt;
+    while (rt_beg > 0 && IsIdentChar(stripped[rt_beg - 1])) {
+        rt_beg--;
+    }
+    if (stripped.substr(rt_beg, rt - rt_beg) != "void") {
+        return false;  // not the plain definition spelling: unprovable
+    }
+    const size_t body_open = stripped.find('{', main_pos);
+    if (body_open == std::string::npos || body_open > construction_pos) {
+        return false;
+    }
+    // Straight-line check: no brace, no label, and no control-flow keyword between the opening
+    // brace and the construction. (`if` and `switch` matter too: a conditionally-skipped
+    // construction leaves later calls on a dead object only in ill-formed code, but pessimism is
+    // free. A single `:` rejects LABELS -- a later backward `goto` would re-run the construction
+    // from outside this scanned region -- at the cost of also rejecting ternaries here.)
+    static const std::string kControl[] = {"for", "while", "do", "if", "switch", "goto"};
+    for (size_t p = body_open + 1; p < construction_pos; p++) {
+        const char c = stripped[p];
+        if (c == '{' || c == '}') {
+            return false;
+        }
+        if (c == ':') {
+            if (p + 1 < stripped.size() && stripped[p + 1] == ':') {
+                p++;  // `::` qualification (args::x, sem::x): fine
+                continue;
+            }
+            return false;  // a label (or ternary): jump target ahead of the construction
+        }
+        if (!IsIdentChar(c) || (p > 0 && IsIdentChar(stripped[p - 1]))) {
+            continue;  // only inspect identifier starts
+        }
+        size_t q = p;
+        while (q < construction_pos && IsIdentChar(stripped[q])) {
+            q++;
+        }
+        const std::string word = stripped.substr(p, q - p);
+        if (std::find(std::begin(kControl), std::end(kControl), word) != std::end(kControl)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Source-level scannability gate, checked on the RAW text (the stripper erases string
 // contents, so include targets and directives must be inspected before stripping). Anything
 // this cannot fully account for makes the whole kernel unscannable (=> every binding WRITER):
 //  - every '#' directive containing 'include' is parsed properly (any spacing, #include_next,
-//    macro-computed includes): quoted targets must live under api/ or experimental/; angle
-//    targets must be plain slash-free system headers (<cstdint>); anything else fails.
+//    macro-computed includes): quoted targets must live under api/ or experimental/, contain
+//    no ".." traversal, and not be shadowed by a same-named file next to the kernel (quoted
+//    includes search the kernel's own directory first); angle targets must be plain slash-free
+//    system headers (<cstdint>); anything else fails.
 //  - '#define' anywhere: a macro could rename a method or hide a call.
+//  - a comment token straight after '#': it hides the directive from this raw-text parse.
 //  - raw string literals (R") and backslash-newline splices: they defeat the simple lexer.
 // A '#include' inside a comment fails too -- pessimism is free, unsoundness is not.
-bool KernelIncludesAreScannable(const std::string& raw) {
+// (User -D defines and -I include paths are gated separately at the call site: both can make
+// the compiler see code this scan cannot.)
+bool KernelIncludesAreScannable(const std::string& raw, const std::filesystem::path& kernel_dir) {
     if (raw.find("R\"") != std::string::npos || raw.find("\\\n") != std::string::npos ||
         raw.find("\\\r") != std::string::npos) {
         return false;
+    }
+    // Digraphs are valid C++ alternative tokens the lexical scans below cannot see: `%:` is '#'
+    // (a hidden directive), `<%`/`%>` are '{'/'}' (a hidden brace defeats the construction
+    // prover's straight-line check), `<:`/`:>` are '['/']'. All-or-nothing rejection; no in-tree
+    // kernel uses any (the `<::` template spelling would false-hit `<:`, and that is fine --
+    // pessimism is free).
+    for (const char* digraph : {"%:", "<%", "%>", "<:", ":>"}) {
+        if (raw.find(digraph) != std::string::npos) {
+            return false;
+        }
     }
     for (size_t pos = raw.find('#'); pos != std::string::npos; pos = raw.find('#', pos + 1)) {
         size_t p = pos + 1;
         while (p < raw.size() && (raw[p] == ' ' || raw[p] == '\t')) {
             p++;
+        }
+        // After the skippable blanks, only a directive name or an empty directive (newline/EOF)
+        // is scannable. Anything else -- a comment splice (`#/*c*/include`), form-feed or
+        // vertical-tab (both directive whitespace to the compiler, invisible to this parse),
+        // any control byte -- could hide a directive: unscannable.
+        if (p < raw.size() && raw[p] != '\n' && raw[p] != '\r' &&
+            !(std::isalnum(static_cast<unsigned char>(raw[p])) || raw[p] == '_')) {
+            return false;
         }
         size_t d_beg = p;
         while (p < raw.size() && (std::isalnum(static_cast<unsigned char>(raw[p])) || raw[p] == '_')) {
@@ -585,6 +743,14 @@ bool KernelIncludesAreScannable(const std::string& raw) {
             if (inc.rfind("api/", 0) != 0 && inc.rfind("experimental/", 0) != 0) {
                 return false;  // a local helper could hide an access we cannot see
             }
+            if (inc.find("..") != std::string::npos) {
+                return false;  // "api/../x.h" escapes the trusted tree while keeping the prefix
+            }
+            // Quoted includes search the including file's own directory FIRST, so a file at
+            // <kernel_dir>/api/... would SHADOW the trusted repo header the prefix vouches for.
+            if (!kernel_dir.empty() && std::filesystem::exists(kernel_dir / inc)) {
+                return false;
+            }
         } else if (raw[p] == '<') {
             const size_t end = raw.find('>', p + 1);
             if (end == std::string::npos) {
@@ -611,6 +777,9 @@ bool KernelIncludesAreScannable(const std::string& raw) {
 //   Gen2, single-node sem, all binders   -> DM_LOCAL_CACHED (node-local AMO; any number of
 //         DM kernels confined to it         binder kernels/threads)
 //   anything else (off-node reach)       -> EXTERNAL (self-targeted NoC atomic)
+// An EXTERNAL result is not necessarily final: the source access-scan refinement downstream
+// (see the gap-3/gap-8 arms in BuildProgramFromSpec) may downgrade it to LOCAL_NONATOMIC /
+// REMOTE_POSTED when it can PROVE the writes cannot race.
 SemScope ResolveSemaphoreScope(const SemaphoreSpec& sem, const CollectedSpecData::SemaphoreBinderInfo& binders) {
     // Gen1 keeps the uncached RMW every semaphore has always used there; the atomic tiers are
     // Quasar hardware paths, so no existing Gen1 program changes mechanism.
@@ -2987,7 +3156,8 @@ tt::tt_metal::SemaphoreBindingHandleMap MakeSemaphoreBindingHandles(
     const KernelSpec& kernel_spec,
     const CollectedSpecData& collected,
     const SemaphoreNameToIdMap& semaphore_name_to_id,
-    const SemaphoreNameToScopeMap& semaphore_name_to_scope) {
+    const SemaphoreNameToScopeMap& semaphore_name_to_scope,
+    const std::unordered_map<SemaphoreSpecName, const KernelSpec*>& sem_posted_writer) {
     tt::tt_metal::SemaphoreBindingHandleMap out;
     out.reserve(kernel_spec.semaphore_bindings.size());
     for (const auto& semaphore_binding : kernel_spec.semaphore_bindings) {
@@ -2998,7 +3168,12 @@ tt::tt_metal::SemaphoreBindingHandleMap MakeSemaphoreBindingHandles(
             kernel_spec.unique_id,
             semaphore_binding.semaphore_spec_name,
             id);
-        const SemScope scope = semaphore_name_to_scope.at(semaphore_binding.semaphore_spec_name);
+        // Per-binder override: a gap-8 semaphore's sole off-node writer bakes REMOTE_POSTED;
+        // every other binder bakes the (LOCAL_NONATOMIC) default from the map.
+        const auto posted_it = sem_posted_writer.find(semaphore_binding.semaphore_spec_name);
+        const SemScope scope = (posted_it != sem_posted_writer.end() && posted_it->second == &kernel_spec)
+                                   ? SemScope::REMOTE_POSTED
+                                   : semaphore_name_to_scope.at(semaphore_binding.semaphore_spec_name);
         const uint32_t total_binder_harts =
             scope == SemScope::DM_LOCAL_CACHED
                 ? SemaphoreBinders(collected, semaphore_binding.semaphore_spec_name).binder_instance_count
@@ -3521,28 +3696,32 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
     }
 
     // Access-scan refinement of would-be-EXTERNAL semaphores ONLY (never touches LOCAL/CACHED
-    // picks). One shape escapes the NoC-atomic tax when the conservative source scan can PROVE
+    // picks). Two shapes escape the NoC-atomic tax when the conservative source scan can PROVE
     // the access pattern (anything unprovable stays EXTERNAL -- see ScanSemaphoreAccess):
-    //   sole writer (1 instance) ON the sem's node, every other binder provably read-only
-    //   -> everyone bakes LOCAL_NONATOMIC (the plain word is already NoC-readable, and remote
-    //      observation costs a NoC read under every mechanism).
-    // The OFF-node-sole-writer sibling (posted value-writes instead of atomics) is deliberately
-    // NOT implemented: its write primitive (noc_inline_dw_write) HANGS on the Quasar RTL from a
-    // DM kernel (watcher-verified: sender wedged at NWIW) -- it needs its own characterization
-    // keystone first. Gen2 + non-emule only (emule keeps the Gen1 arms).
+    //   gap 3: sole LOCAL_WRITER (1 instance) ON the sem's node, every other binder read-only
+    //          -> everyone bakes LOCAL_NONATOMIC (the plain word is already NoC-readable).
+    //   gap 8: sole REMOTE_UP_ONLY writer (1 instance) OFF the sem's node, every other binder
+    //          read-only, init_value 0, and the writer kernel has no other same-id binding
+    //          -> the writer bakes REMOTE_POSTED (staged plain value-writes; NOT the inline-dw
+    //             primitive, which hangs on this RTL from DM kernels in both posted and
+    //             non-posted forms -- watcher-verified), everyone else LOCAL_NONATOMIC.
+    // Gen2 + non-emule only (emule keeps the Gen1 arms).
+    std::unordered_map<SemaphoreSpecName, const KernelSpec*> sem_posted_writer;
     if (is_gen2_arch() && cached_tier_available()) {
         std::unordered_map<const KernelSpec*, std::optional<std::string>> stripped_cache;
         auto stripped_source = [&](const KernelSpec* k) -> const std::optional<std::string>& {
             auto it = stripped_cache.find(k);
             if (it == stripped_cache.end()) {
                 std::optional<std::string> text;
-                // User -D defines could rename identifiers the scan keys on; don't try to see
-                // through them (both #if arms are scanned anyway, so defines that only SELECT
-                // code are the ones we lose -- an acceptable pessimism).
-                if (k->compiler_options.defines.empty()) {
-                    text = ReadKernelSourceText(*k);
+                std::filesystem::path kernel_dir;
+                // User -D defines could rename identifiers the scan keys on, and user -I paths
+                // could satisfy an include with a header the allowlist cannot vouch for; don't
+                // try to see through either (both #if arms are scanned anyway, so options that
+                // only SELECT code are the ones we lose -- an acceptable pessimism).
+                if (k->compiler_options.defines.empty() && k->compiler_options.include_paths.empty()) {
+                    text = ReadKernelSourceText(*k, &kernel_dir);
                 }
-                if (text.has_value() && !KernelIncludesAreScannable(*text)) {
+                if (text.has_value() && !KernelIncludesAreScannable(*text, kernel_dir)) {
                     text.reset();  // unscannable source: treat every binding as writer
                 }
                 if (text.has_value()) {
@@ -3588,12 +3767,39 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
                 continue;  // multiple writer instances need real atomicity
             }
             const bool writer_on_node = sem_nodes.merge(writer_nodes).num_cores() == sem_nodes.num_cores();
+            const bool writer_off_node = !sem_nodes.intersects(writer_nodes);
             if (writer_on_node && writer_class == SemAccessClass::LOCAL_WRITER) {
-                // The sole on-node writer provably uses ONLY the plain-local forms, so its word
-                // is already correct and NoC-readable. A WRITER-class sole writer must NOT be
-                // demoted: it could mix a (self-targeted) remote up() -- an asynchronous NoC
-                // atomic -- with plain RMWs on the same word, which only EXTERNAL serializes.
+                // gap 3: the sole on-node writer provably uses ONLY the plain-local forms, so
+                // its word is already correct and NoC-readable. A WRITER-class sole writer must
+                // NOT be demoted: it could mix a (self-targeted) remote up() -- an asynchronous
+                // NoC atomic -- with plain RMWs on the same word, which only EXTERNAL serializes.
                 semaphore_name_to_scope[semaphore_name] = SemScope::LOCAL_NONATOMIC;
+            } else if (
+                writer_off_node && writer_class == SemAccessClass::REMOTE_UP_ONLY &&
+                semaphore_spec.advanced_options.initial_value == 0 &&
+                ProvesSingleTopLevelConstruction(*stripped_source(writer->kernel), writer->binding->accessor_name)) {
+                // gap 8 -- with the audit-mandated guards: the staged running count is absolute,
+                // so init must be 0 (re-checked here, not just in skippable validation); the
+                // count lives in the writer's Semaphore OBJECT, so the source must prove exactly
+                // one straight-line construction (a loop/helper re-construction would restart
+                // it); and the writer kernel must not bind another semaphore sharing this table
+                // slot (per-binder scopes are invisible to the id-collision fixpoint; refuse up
+                // front). Sharing the per-hart staging slot with OTHER slot users (an EXTERNAL
+                // binding's returning atomics, a second REMOTE_POSTED sem) is safe: the device
+                // arm waits for each staged write to DEPART before returning.
+                const uint32_t this_id = semaphore_name_to_id.at(semaphore_name);
+                bool id_clash = false;
+                for (const auto& other_binding : writer->kernel->semaphore_bindings) {
+                    if (other_binding.semaphore_spec_name != semaphore_name &&
+                        semaphore_name_to_id.at(other_binding.semaphore_spec_name) == this_id) {
+                        id_clash = true;
+                        break;
+                    }
+                }
+                if (!id_clash) {
+                    semaphore_name_to_scope[semaphore_name] = SemScope::LOCAL_NONATOMIC;
+                    sem_posted_writer[semaphore_name] = writer->kernel;
+                }
             }
         }
     }
@@ -3626,6 +3832,7 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
                         SemScope& scope = semaphore_name_to_scope.at(*m);
                         if (scope != SemScope::EXTERNAL) {
                             scope = SemScope::EXTERNAL;
+                            sem_posted_writer.erase(*m);  // demote uniformly: no posted writer either
                             promoted = true;
                         }
                     }
@@ -3642,8 +3849,8 @@ Program BuildProgramFromSpec(distributed::MeshDevice& mesh_device, const Program
         // Make the local accessor name -> DFB device slot map for this kernel
         const tt::tt_metal::DataflowBufferBindingHandleMap dfb_handles =
             MakeDataflowBufferBindingHandles(kernel_spec, dfb_name_to_slot);
-        const tt::tt_metal::SemaphoreBindingHandleMap semaphore_handles =
-            MakeSemaphoreBindingHandles(kernel_spec, collected, semaphore_name_to_id, semaphore_name_to_scope);
+        const tt::tt_metal::SemaphoreBindingHandleMap semaphore_handles = MakeSemaphoreBindingHandles(
+            kernel_spec, collected, semaphore_name_to_id, semaphore_name_to_scope, sem_posted_writer);
 
         // Resolve TensorBindings for this kernel:
         //  - pack each binding's pre-resolved CTA payload into the kernel's positional CTA buffer

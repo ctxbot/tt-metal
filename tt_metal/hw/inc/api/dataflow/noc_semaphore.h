@@ -13,7 +13,10 @@
  *        and baked into the kernel. The path picked provides the fastest access that keeps the
  *        semaphore operations atomic.
  *
- *  - LOCAL_NONATOMIC: L1 read-modify-write. Picked only when at most one binder instance exists.
+ *  - LOCAL_NONATOMIC: L1 read-modify-write. Picked when nothing can race the word: at most one
+ *      binder instance, or a census-proven sole writer whose other binders are all read-only
+ *      (the access-scan refinements in program_spec.cpp; a REMOTE_POSTED writer's home-side
+ *      binders also land here).
  *  - DM_LOCAL_CACHED: Touched only by DM threads on the semaphore's one node -- any number of
  *      binder kernels/threads (the node's DM harts are mutually coherent). Increments are a
  *      32-bit RISC-V AMO and down() an LR/SC conditional decrement, both on the CACHED alias.
@@ -35,6 +38,17 @@ enum class SemScope : uint8_t {
     LOCAL_NONATOMIC = 0,
     DM_LOCAL_CACHED = 1,
     EXTERNAL = 2,
+    // Baked ONLY into a semaphore's sole off-node writer kernel (census-proven: exactly one
+    // 1-instance writer whose ONLY semaphore op is the pinned-channel remote up(); every other
+    // binder provably read-only; initial_value == 0, the staged count is absolute; the object
+    // provably constructed exactly once, in straight-line code; no other same-id binding).
+    // up(noc,x,y,v) keeps a private running count, stages it in THIS hart's CAS-return slot,
+    // plain-writes it to the home cell, and waits for the write to DEPART -- so the slot is
+    // quiescent again before up() returns and any other slot user (an EXTERNAL binding's
+    // returning atomics, another REMOTE_POSTED semaphore) is safe to follow. A sole writer
+    // needs no atomicity, and the count is MONOTONIC, so the home word only ever moves up.
+    // Home binders bake LOCAL_NONATOMIC.
+    REMOTE_POSTED = 3,
 };
 
 // The host's chosen mechanism for each bound semaphore id, injected invisibly by codegen:
@@ -148,6 +162,9 @@ public:
      * @param value The value to increment the semaphore by.
      */
     __attribute__((always_inline)) void up(uint32_t value) {
+        if (scope_ == SemScope::REMOTE_POSTED) {
+            ASSERT(false);  // the sole remote writer must use up(noc, x, y, value)
+        }
         if (scope_ == SemScope::DM_LOCAL_CACHED) {
 #if defined(ARCH_QUASAR) && !defined(COMPILE_FOR_TRISC)
             __atomic_add_fetch(reinterpret_cast<uint32_t*>(l1_offset_), value, __ATOMIC_SEQ_CST);
@@ -182,6 +199,31 @@ public:
         const Noc& noc, uint32_t noc_x, uint32_t noc_y, uint32_t value, uint8_t vc = NOC_UNICAST_WRITE_VC) {
         ASSERT(scope_ != SemScope::DM_LOCAL_CACHED);
         const uint64_t dest_noc_addr = get_noc_addr(noc_x, noc_y, noc.get_noc_id());
+#if defined(ARCH_QUASAR) && !defined(COMPILE_FOR_TRISC) && !defined(TT_EMULE_USE_L1_POOL)
+        // (emule never bakes REMOTE_POSTED -- the census excludes it -- and cannot compile
+        // cas_ret_slot(); it falls through to the atomic form below, correct for any scope.)
+        if (scope_ == SemScope::REMOTE_POSTED) {
+            // Sole-writer fast path (see the enum doc). The running count lives in the object;
+            // the host bakes this scope only when the source provably constructs the Semaphore
+            // exactly once, in straight-line code (a re-construction would restart the count).
+            posted_count_ += value;
+            // Stage in this hart's CAS-return slot and deliver with a plain 4B write via the
+            // write_cmd_buf route -- the ONLY plain-write path proven on the Quasar RTL (the
+            // set_remote/inline-dw routes wedge from DM kernels: NSSW/NWIW, watcher-
+            // characterized). Then wait for DEPARTURE (wr_sent, not tr_ack): once the NIU has
+            // source-read the slot it is free for any later user on this hart (an EXTERNAL
+            // down()'s sentinel/pre-op returns, another REMOTE_POSTED semaphore). The LAST
+            // write's ack is drained by the generated kernel_main exit stub (genfiles.cpp), so
+            // user code owes no barrier. Same-route writes stay ordered, so the home word only
+            // ever sees this object's non-decreasing counts.
+            const uint32_t stage = cas_ret_slot();
+            *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(static_cast<uintptr_t>(MEM_L1_UNCACHED_BASE) + stage) =
+                posted_count_;
+            noc_async_write(stage, dest_noc_addr, sizeof(uint32_t), noc.get_noc_id());
+            noc_async_writes_flushed(noc.get_noc_id());
+            return;
+        }
+#endif
         noc_semaphore_inc(dest_noc_addr, value, noc.get_noc_id(), vc);
     }
 
@@ -200,6 +242,7 @@ public:
      * @param value The value to decrement the semaphore by.
      */
     __attribute__((always_inline)) void down(uint32_t value) {
+        ASSERT(scope_ != SemScope::REMOTE_POSTED);  // sole remote writer: up(noc,x,y,v) only
         auto* sem_addr = local_ptr();
         WAYPOINT("NSDW");
         if (scope_ == SemScope::DM_LOCAL_CACHED) {
@@ -310,14 +353,20 @@ public:
      *
      * @param value The value to wait for.
      */
-    __attribute__((always_inline)) void wait(uint32_t value) { noc_semaphore_wait(local_ptr(), value); }
+    __attribute__((always_inline)) void wait(uint32_t value) {
+        ASSERT(scope_ != SemScope::REMOTE_POSTED);  // the sole remote writer has no local cell to watch
+        noc_semaphore_wait(local_ptr(), value);
+    }
 
     /**
      * @brief Block until the semaphore is at least the specified value.
      *
      * @param value The minimum value to wait for.
      */
-    __attribute__((always_inline)) void wait_min(uint32_t value) { noc_semaphore_wait_min(local_ptr(), value); }
+    __attribute__((always_inline)) void wait_min(uint32_t value) {
+        ASSERT(scope_ != SemScope::REMOTE_POSTED);
+        noc_semaphore_wait_min(local_ptr(), value);
+    }
 
     /**
      * @brief Set the semaphore to the specified value.
@@ -327,7 +376,10 @@ public:
      *
      * @param value The value to set the semaphore to.
      */
-    __attribute__((always_inline)) void set(uint32_t value) { noc_semaphore_set(local_ptr(), value); }
+    __attribute__((always_inline)) void set(uint32_t value) {
+        ASSERT(scope_ != SemScope::REMOTE_POSTED);
+        noc_semaphore_set(local_ptr(), value);
+    }
 
     /**
      * @brief Read the current semaphore value through this scope's coherent view.
@@ -346,6 +398,11 @@ public:
      *       Neither endpoint may be DM_LOCAL_CACHED (a relay is a NoC write; the cached pool
      *       must never be NoC-written) -- guarded by the runtime ASSERT below (the census sees topology, not method
      * calls).
+     * @warning QUASAR DM: this primitive rides noc_semaphore_set_remote (the write_reg_cmd_buf
+     *       route), which the current RTL characterization shows WEDGING from DM kernels
+     *       (watcher waypoint NSSW -- same finding that moved REMOTE_POSTED onto plain
+     *       noc_async_write). No in-tree kernel calls relay today; re-characterize before
+     *       relying on it from a Quasar DM kernel.
      *
      * @param noc The Noc object representing the NoC to use for the transaction.
      * @param dst_sem The destination Semaphore whose L1 offset receives the value.
@@ -466,6 +523,8 @@ public:
 private:
     uintptr_t l1_offset_;  // physical L1 offset of the semaphore word (cached-alias address)
     SemScope scope_;       // host-chosen mechanism (from the invisible codegen table)
+    // REMOTE_POSTED only: the sole writer's private running count (one construction per kernel).
+    uint32_t posted_count_ = 0;
 
     // Local access pointer for reads / non-atomic writes. Uncached alias on Quasar for
     // LOCAL_NONATOMIC and EXTERNAL; cached alias for DM_LOCAL_CACHED.

@@ -31,13 +31,15 @@ namespace tt::tt_metal {
 // Scoped semaphore (SemScope) tests.
 // ============================================================================
 // Exercises the scoped device Semaphore class (noc_semaphore.h) end-to-end
-// across all three mechanisms -- LOCAL_NONATOMIC (plain L1 RMW),
+// across all four mechanisms -- LOCAL_NONATOMIC (plain L1 RMW),
 // DM_LOCAL_CACHED (32-bit AMO on the cached alias), EXTERNAL (self-targeted
-// NoC atomic). The host resolves each semaphore's mechanism purely from a
-// binder-topology census (program_spec.cpp) -- nothing is configurable on the
-// SemaphoreSpec -- so every test here constructs the SHAPE that makes the
-// census pick the mechanism under test. Raw hardware atomicity is covered by
-// the keystone tests (NocSelfAtomicFixture).
+// NoC atomic), REMOTE_POSTED (sole off-node writer's staged plain writes).
+// The host resolves each semaphore's mechanism from a binder-topology census
+// plus a conservative source access-scan refinement (program_spec.cpp) --
+// nothing is configurable on the SemaphoreSpec -- so every test here
+// constructs the SHAPE (topology + provable source) that makes the host pick
+// the mechanism under test. Raw hardware atomicity is covered by the keystone
+// tests (NocSelfAtomicFixture).
 // ============================================================================
 class SemScopeFixture : public MeshDispatchFixture {
 protected:
@@ -52,6 +54,8 @@ protected:
         "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_remote_sender.cpp";
     const std::string kernel_path_remote_receiver =
         "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_remote_receiver.cpp";
+    const std::string kernel_path_posted_loop_ctor =
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_scope_posted_loop_ctor.cpp";
     const std::string kernel_path_readonly_observer =
         "tests/tt_metal/tt_metal/test_kernels/dataflow/sem_readonly_observer.cpp";
     const std::string kernel_path_local_writer =
@@ -80,10 +84,13 @@ protected:
     // resolve for the shape this helper builds:
     //   LOCAL_NONATOMIC -> sole binder kernel, one thread: nothing can race, the cheap pick
     //                      (resolution pinned by TestCensusSingleWriterPicksLocal)
-    //   EXTERNAL        -> a read-only OBSERVER kernel binds the semaphore from second_node():
-    //                      an OFF-NODE binder is what forces the NoC atomic (pinned by
-    //                      TestCensusOffNodeBinderBlocksCached) -- an on-node observer would
-    //                      stay DM_LOCAL_CACHED now. Callers must skip-guard on has_second_node().
+    //   EXTERNAL        -> the census-probe kernel binds the semaphore from second_node(): an
+    //                      off-node binder rules out CACHED (pinned by
+    //                      TestCensusOffNodeBinderBlocksCached), and the probe's raw ring-
+    //                      residency read makes it scan WRITER, so the gap-3 refinement cannot
+    //                      demote the pair below EXTERNAL (a PROVABLY read-only off-node binder
+    //                      would: TestCensusSoleWriterWithReadOnlyRemoteObserverPicksLocal).
+    //                      Callers must skip-guard on has_second_node().
     // DM_LOCAL_CACHED is NOT constructible here: the cached pick needs >= 2 writer threads and
     // the smoke kernel reports without cross-thread sync, so there is no deterministic readback.
     // Cached coverage lives in run_concurrent and the census-probe tests.
@@ -380,14 +387,23 @@ protected:
     }
 
     // Remote-up run: a SENDER kernel on second_node() bumps sem::counter on `core` purely via
-    // Semaphore::up(noc, x, y, 1) while a RECEIVER kernel on `core` waits for the exact total,
-    // then reports {baked scope, value()}. Two binder kernels with one off the semaphore's node:
-    // the census must resolve EXTERNAL. Callers must skip-guard on has_second_node().
-    std::pair<uint32_t, uint32_t> run_remote(uint32_t sender_threads, uint32_t iters) {
+    // Semaphore::up(noc, x, y, 1) while a RECEIVER kernel on `core` waits for the exact total.
+    // Both sides report their baked scope (the receiver also reports value()), so the tests pin
+    // the HOST'S ACTUAL per-kernel decision: a 1-instance provable sender bakes REMOTE_POSTED
+    // with the home side on the plain word (gap 8); anything unprovable or multi-instance keeps
+    // both sides EXTERNAL. Callers must skip-guard on has_second_node().
+    struct RemoteResult {
+        uint32_t receiver_scope;
+        uint32_t value;
+        uint32_t sender_scope;
+    };
+    RemoteResult run_remote(uint32_t sender_threads, uint32_t iters, const std::string& sender_source = "") {
         const uint32_t expected = sender_threads * iters;
-        // Sentinel prefill: see run_scope.
+        // Sentinel prefill on BOTH report words: see run_scope.
         std::vector<uint32_t> sentinel(2, kNoReport);
         tt::tt_metal::detail::WriteToDeviceL1(device_, core, report_addr, sentinel);
+        std::vector<uint32_t> sender_sentinel(1, kNoReport);
+        tt::tt_metal::detail::WriteToDeviceL1(device_, second_node(), report_addr, sender_sentinel);
 
         // The sender addresses the semaphore's node by its virtual NoC coords.
         const CoreCoord core_virtual = mesh_device_->worker_core_from_logical_core(core);
@@ -403,11 +419,12 @@ protected:
         const experimental::KernelSpecName RECEIVER{"sem_remote_receiver"};
         experimental::KernelSpec sender_spec{
             .unique_id = SENDER,
-            .source = kernel_path_remote_sender,
+            .source = sender_source.empty() ? kernel_path_remote_sender : sender_source,
             .num_threads = sender_threads,
             .semaphore_bindings =
                 {{.semaphore_spec_name = experimental::SemaphoreSpecName{"counter_sem"}, .accessor_name = "counter"}},
-            .runtime_arg_schema = {.runtime_arg_names = {"increment_times", "remote_noc_x", "remote_noc_y"}},
+            .runtime_arg_schema =
+                {.runtime_arg_names = {"report_addr", "increment_times", "remote_noc_x", "remote_noc_y"}},
             .hw_config = experimental::DataMovementGen2Config{},
         };
         experimental::KernelSpec receiver_spec{
@@ -436,7 +453,8 @@ protected:
                 .kernel = SENDER,
                 .runtime_arg_values = experimental::MakeRuntimeArgsForSingleNode(
                     second_node(),
-                    {{"increment_times", iters},
+                    {{"report_addr", report_addr},
+                     {"increment_times", iters},
                      {"remote_noc_x", static_cast<uint32_t>(core_virtual.x)},
                      {"remote_noc_y", static_cast<uint32_t>(core_virtual.y)}}),
             },
@@ -453,11 +471,15 @@ protected:
         tt::tt_metal::detail::ReadFromDeviceL1(device_, core, report_addr, 2 * sizeof(uint32_t), result);
         EXPECT_EQ(result.size(), 2u);
         if (result.size() < 2) {
-            return {kNoReport, 0u};
+            return {kNoReport, 0u, kNoReport};
         }
-        // The receiver must have overwritten the sentinel, or the assertions pass vacuously.
+        // Both reporters must have overwritten their sentinels, or the assertions pass vacuously.
         EXPECT_NE(result[0], kNoReport) << "receiver never reported";
-        return {result[0], result[1]};
+        std::vector<uint32_t> sender_result;
+        tt::tt_metal::detail::ReadFromDeviceL1(device_, second_node(), report_addr, sizeof(uint32_t), sender_result);
+        const uint32_t sender_scope = sender_result.empty() ? kNoReport : sender_result[0];
+        EXPECT_NE(sender_scope, kNoReport) << "sender never reported its scope";
+        return {result[0], result[1], sender_scope};
     }
 
     // ---- Census probe harness ----
@@ -770,36 +792,79 @@ TEST_F(SemScopeFixture, TestCachedExternalCoexistence) {
 // The receiver wait_min()s for the expected total before reporting, so a LOST increment
 // manifests as a hang; the exact-count EXPECTs catch overshoot and wrong-word landings.
 
-// One off-node sender thread. Exact count proves remote up() reaches the semaphore's word and
-// loses nothing; the scope report proves an off-node WRITER keeps the semaphore EXTERNAL (the
-// access-scan refinement applies only to on-node sole writers -- the posted-write fast path for
-// off-node sole writers is deferred: its write primitive hangs on the Quasar RTL, see the
-// refinement comment in program_spec.cpp).
-TEST_F(SemScopeFixture, TestExternalRemoteUpExactCount) {
+// GAP-8 KEYSTONE: one off-node sender thread whose only op is the pinned-channel remote up(),
+// plus a provably read-only receiver -- the access scan proves the shape, so the sender bakes
+// REMOTE_POSTED (private running count, staged in its CAS-return slot, delivered by plain
+// 4B writes -- NOT the inline-dw primitive, which hangs on this RTL) and the receiver bakes
+// LOCAL_NONATOMIC. BOTH baked scopes are asserted (the sender reports its own table entry, so
+// a silent fallback to EXTERNAL cannot pass), and the sender's user code issues NO write
+// barrier -- the arm's per-call departure flush plus the generated exit-stub ack drain must be
+// self-sufficient. Exact count proves the staged running value lands losslessly.
+TEST_F(SemScopeFixture, TestRemotePostedSoleWriterExactCount) {
     if (!has_second_node()) {
         GTEST_SKIP() << "needs >= 2 worker nodes for an off-node sender";
     }
-    const auto [scope, value] = run_remote(/*sender_threads=*/1, iterations);
-    log_info(LogTest, "EXTERNAL remote up: scope={} value={} (expected {})", scope, value, iterations);
-    EXPECT_EQ(scope, scope_val(SemScope::EXTERNAL))
-        << "an off-node writer must keep the semaphore EXTERNAL (no posted fast path yet)";
-    EXPECT_EQ(value, iterations)
-        << "Semaphore::up(noc, x, y, 1) from an off-node single sender overshot or hit the wrong word "
-           "(a LOST increment would hang in the receiver's wait_min, not fail here).";
+    const auto r = run_remote(/*sender_threads=*/1, iterations);
+    log_info(
+        LogTest,
+        "REMOTE_POSTED sole writer: receiver scope={} sender scope={} value={} (expected {})",
+        r.receiver_scope,
+        r.sender_scope,
+        r.value,
+        iterations);
+    EXPECT_EQ(r.sender_scope, scope_val(SemScope::REMOTE_POSTED))
+        << "the provable sole off-node writer must actually bake the posted fast path (gap 8)";
+    EXPECT_EQ(r.receiver_scope, scope_val(SemScope::LOCAL_NONATOMIC))
+        << "a provably sole off-node writer must let the home side keep the plain word (gap 8)";
+    EXPECT_EQ(r.value, iterations) << "the sole sender's staged running value overshot or hit the wrong word "
+                                      "(a LOST/reordered write would hang in the receiver's wait_min, not fail here).";
 }
 
-// All user-DM sender threads hammer the SAME remote word. Exact count proves the remote
-// increments from independent harts stay mutually atomic through the class API.
+// NEGATIVE (construction-once gate): identical sole-off-node-writer topology, but the sender
+// constructs its Semaphore INSIDE the up loop. The posted running count lives in the object, so
+// the census must refuse REMOTE_POSTED (a per-iteration re-construction would restart it) and
+// keep BOTH sides EXTERNAL -- under which the per-iteration construction is harmless, so the
+// count still lands exactly.
+TEST_F(SemScopeFixture, TestCensusLoopConstructedSenderStaysExternal) {
+    if (!has_second_node()) {
+        GTEST_SKIP() << "needs >= 2 worker nodes for an off-node sender";
+    }
+    const auto r = run_remote(/*sender_threads=*/1, iterations, kernel_path_posted_loop_ctor);
+    log_info(
+        LogTest,
+        "loop-constructed sender: receiver scope={} sender scope={} value={} (expected {})",
+        r.receiver_scope,
+        r.sender_scope,
+        r.value,
+        iterations);
+    EXPECT_EQ(r.sender_scope, scope_val(SemScope::EXTERNAL))
+        << "a loop-constructed sender is not provably construction-once: POSTED must not bake";
+    EXPECT_EQ(r.receiver_scope, scope_val(SemScope::EXTERNAL))
+        << "with no posted writer the refinement must leave the whole semaphore EXTERNAL";
+    EXPECT_EQ(r.value, iterations) << "EXTERNAL remote ups from a loop-constructed object lost updates";
+}
+
+// CONTRAST: all user-DM sender threads hammer the SAME remote word -- multiple writer
+// instances, so the refinement must NOT fire (independent staged counts would corrupt) and the
+// census must stay EXTERNAL. Exact count proves the remote increments stay mutually atomic.
 TEST_F(SemScopeFixture, TestExternalRemoteUpConcurrentExactCount) {
     if (!has_second_node()) {
         GTEST_SKIP() << "needs >= 2 worker nodes for an off-node sender";
     }
-    const auto [scope, value] = run_remote(num_dms_, concurrent_iterations);
+    const auto r = run_remote(num_dms_, concurrent_iterations);
     const uint32_t expected = num_dms_ * concurrent_iterations;
-    log_info(LogTest, "EXTERNAL concurrent remote up: scope={} value={} (expected {})", scope, value, expected);
-    EXPECT_EQ(scope, scope_val(SemScope::EXTERNAL))
-        << "the census must resolve an off-node-written semaphore to EXTERNAL in both kernels";
-    EXPECT_EQ(value, expected)
+    log_info(
+        LogTest,
+        "EXTERNAL concurrent remote up: receiver scope={} sender scope={} value={} (expected {})",
+        r.receiver_scope,
+        r.sender_scope,
+        r.value,
+        expected);
+    EXPECT_EQ(r.receiver_scope, scope_val(SemScope::EXTERNAL))
+        << "the census must resolve a multi-instance off-node-written semaphore to EXTERNAL";
+    EXPECT_EQ(r.sender_scope, scope_val(SemScope::EXTERNAL))
+        << "multiple sender instances must never bake the posted fast path";
+    EXPECT_EQ(r.value, expected)
         << "concurrent Semaphore::up(noc, x, y, 1) from " << num_dms_
         << " sender threads overshot or landed on the wrong word (undercount from lost updates would "
            "hang in the receiver's wait_min before reporting).";

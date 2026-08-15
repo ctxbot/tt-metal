@@ -437,7 +437,9 @@ TEST(Metal2SemaphoreHygiene, NoRawSemaphoreAccessInMetal2Kernels) {
         root / "tests",
         // Adjacent-literal split: CI budgets whole-word 'ttnn' mentions under tests/tt_metal
         // (layering lint); this is a scan PATH, not a layering violation, so keep it off budget.
-        root / "tt" "nn",
+        root /
+            "tt"
+            "nn",
     };
 
     std::vector<std::string> violations;

@@ -24,6 +24,8 @@ enum class SemScope : uint8_t {
     LOCAL_NONATOMIC = 0,
     DM_LOCAL_CACHED = 1,
     EXTERNAL = 2,
+    // Sole off-node writer's staged-plain-write fast path (see noc_semaphore.h).
+    REMOTE_POSTED = 3,
 };
 
 namespace tt::tt_metal {
@@ -84,6 +86,7 @@ inline void emit_sem_ids_and_tripwires(std::ostream& os, const std::vector<SemBi
        << static_cast<int>(SemScope::LOCAL_NONATOMIC)
        << " && static_cast<int>(::SemScope::DM_LOCAL_CACHED) == " << static_cast<int>(SemScope::DM_LOCAL_CACHED)
        << " && static_cast<int>(::SemScope::EXTERNAL) == " << static_cast<int>(SemScope::EXTERNAL)
+       << " && static_cast<int>(::SemScope::REMOTE_POSTED) == " << static_cast<int>(SemScope::REMOTE_POSTED)
        << ", \"device SemScope numbering diverged from the host mirror (jit_build_settings.hpp)\");\n";
     for (const auto& entry : entries) {
         os << "static_assert(::sem_scope_of(" << entry.id << "u) == static_cast<::SemScope>("
