@@ -19,6 +19,8 @@
 namespace ttnn::experimental::prim {
 
 namespace {
+constexpr uint32_t max_fabric2d_sender_connections = 4;
+
 ttnn::Shape get_tiled_shape(const ttnn::Tensor& input_tensor) {
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
     const auto& shape = input_tensor.padded_shape();
@@ -123,11 +125,12 @@ AllToAllAsyncGenericProgram::create_at(
         tensor_args.input_tensor, mesh_coordinate, 1, effective_topology, operation_attributes.cluster_axis);
     const std::optional<MeshCoordinate> backward_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
         tensor_args.input_tensor, mesh_coordinate, -1, effective_topology, operation_attributes.cluster_axis);
-    const auto [fabric_neighbors, fabric_directions] = ttnn::operations::ccl::common::get_neighbors(
-        tensor_args.input_tensor.device()->get_view(),
-        mesh_coordinate,
-        connection_topology,
-        operation_attributes.cluster_axis);
+    const auto fabric_directions = ttnn::operations::ccl::common::get_neighbors(
+                                       tensor_args.input_tensor.device()->get_view(),
+                                       mesh_coordinate,
+                                       connection_topology,
+                                       operation_attributes.cluster_axis)
+                                       .second;
 
     TT_FATAL(device_index < operation_attributes.num_devices, "DEBUG: device_index: {}", device_index);
 
@@ -193,7 +196,61 @@ AllToAllAsyncGenericProgram::create_at(
     // logical shortest path does not identify the first physical hop.
     constexpr uint32_t preferred_workers_per_direction = 3;
     constexpr uint32_t mux_num_directions = 2;
-    const bool direction_routing_is_physical = !is_ring || fabric_has_wrap_links;
+    // Direction-owned workers are valid only when every positive logical destination has the same physical first hop,
+    // and likewise for every negative destination, from every source in the collective. This must be a collective-wide
+    // decision: a folded logical axis can look straight from some sources but turn from others, and mixing the muxed
+    // direction schedule with the routed fallback deadlocks their barriers.
+    bool direction_routing_is_physical = !is_ring || fabric_has_wrap_links;
+    if (is_fabric_2d) {
+        direction_routing_is_physical = true;
+        for (uint32_t source_device = 0;
+             source_device < operation_attributes.num_devices && direction_routing_is_physical;
+             ++source_device) {
+            MeshCoordinate source_coord = mesh_coordinate;
+            source_coord[cluster_axis] = source_device;
+            const auto source_node = device->get_fabric_node_id(source_coord);
+            std::optional<tt::tt_fabric::eth_chan_directions> positive_direction;
+            std::optional<tt::tt_fabric::eth_chan_directions> negative_direction;
+            for (uint32_t target_device = 0; target_device < operation_attributes.num_devices; ++target_device) {
+                int32_t device_offset = static_cast<int32_t>(target_device) - static_cast<int32_t>(source_device);
+                if (is_ring) {
+                    const int32_t half_ring = static_cast<int32_t>(operation_attributes.num_devices / 2);
+                    if (device_offset < -half_ring) {
+                        device_offset += operation_attributes.num_devices;
+                    } else if (device_offset > half_ring) {
+                        device_offset -= operation_attributes.num_devices;
+                    }
+                }
+                if (device_offset == 0) {
+                    continue;
+                }
+                const auto target_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
+                    tensor_args.input_tensor,
+                    source_coord,
+                    device_offset,
+                    effective_topology,
+                    operation_attributes.cluster_axis);
+                TT_FATAL(target_coord.has_value(), "No all-to-all target at device offset {}", device_offset);
+                const auto target_node = device->get_fabric_node_id(*target_coord);
+                const auto direction = tt::tt_fabric::get_eth_forwarding_direction(source_node, target_node);
+                TT_FATAL(
+                    direction.has_value(),
+                    "No Fabric2D forwarding direction from all-to-all source {} to target {}",
+                    source_node,
+                    target_node);
+                auto& expected_direction = device_offset > 0 ? positive_direction : negative_direction;
+                if (expected_direction.has_value() && *expected_direction != *direction) {
+                    direction_routing_is_physical = false;
+                    break;
+                }
+                expected_direction = direction;
+            }
+            if (positive_direction.has_value() && negative_direction.has_value() &&
+                *positive_direction == *negative_direction) {
+                direction_routing_is_physical = false;
+            }
+        }
+    }
     const uint32_t max_useful_workers_per_direction =
         is_ring ? preferred_workers_per_direction
                 : std::min(preferred_workers_per_direction, operation_attributes.num_devices - 1);
@@ -574,13 +631,21 @@ AllToAllAsyncGenericProgram::create_at(
                     continue;
                 }
                 TT_FATAL(direction_neighbors[direction].has_value(), "Active all-to-all mux direction has no neighbor");
+                const auto neighbor_node = device->get_fabric_node_id(*direction_neighbors[direction]);
+                const auto valid_links =
+                    tt::tt_fabric::get_forwarding_link_indices(sender_device_fabric_node_id, neighbor_node);
+                TT_FATAL(
+                    !valid_links.empty(),
+                    "No Fabric2D forwarding links from all-to-all source {} to mux neighbor {}",
+                    sender_device_fabric_node_id,
+                    neighbor_node);
                 tt::tt_fabric::add_fabric_mux_v2_to_program(
                     program,
                     mux_config,
                     mux_cores[link][direction],
                     sender_device_fabric_node_id,
-                    device->get_fabric_node_id(*direction_neighbors[direction]),
-                    link);
+                    neighbor_node,
+                    valid_links[link % valid_links.size()]);
             }
         }
     }
@@ -715,26 +780,64 @@ AllToAllAsyncGenericProgram::create_at(
                 {.flow_control_sem_id = flow_control_sem_id, .teardown_sem_id = teardown_sem_id},
                 sender_writer_rt_args);
         } else if (is_fabric_2d) {
+            // Open one routed connection for every physical first-hop direction used by this stream. Logical axes can
+            // fold through the physical mesh, so neither the logical sign nor a single link index identifies all valid
+            // sender planes. The manager tags each connection by physical direction for the kernel's route lookup.
+            std::vector<tt::tt_fabric::FabricNodeId> connection_nodes;
+            std::unordered_set<tt::tt_fabric::eth_chan_directions> used_directions;
             if (is_remote_sender) {
-                // Append connections in the same {E, W, N, S} order as the compile-time direction mask.
-                size_t neighbor_index = 0;
-                for (uint32_t direction = 0; direction < fabric_directions.size(); ++direction) {
-                    if (!fabric_directions[direction]) {
+                for (const int32_t device_offset : device_offsets[sender_stream]) {
+                    if (device_offset == 0) {
                         continue;
                     }
-                    const auto& neighbor_coord = fabric_neighbors[neighbor_index++];
-                    if ((sender_stream_direction_masks[sender_stream] & (1U << direction)) == 0) {
-                        continue;
-                    }
-                    tt::tt_fabric::append_fabric_connection_rt_args(
+                    const auto target_coord = ttnn::ccl::get_physical_neighbor_from_physical_coord(
+                        tensor_args.input_tensor,
+                        mesh_coordinate,
+                        device_offset,
+                        effective_topology,
+                        operation_attributes.cluster_axis);
+                    TT_FATAL(target_coord.has_value(), "No all-to-all target at device offset {}", device_offset);
+                    const auto target_node = device->get_fabric_node_id(*target_coord);
+                    const auto direction =
+                        tt::tt_fabric::get_eth_forwarding_direction(sender_device_fabric_node_id, target_node);
+                    TT_FATAL(
+                        direction.has_value(),
+                        "No Fabric2D forwarding direction from all-to-all source {} to target {}",
                         sender_device_fabric_node_id,
-                        device->get_fabric_node_id(neighbor_coord),
-                        core_id / num_senders_per_link,
-                        program,
-                        {core},
-                        sender_writer_rt_args);
+                        target_node);
+                    if (used_directions.insert(*direction).second) {
+                        connection_nodes.push_back(target_node);
+                    }
                 }
             }
+            TT_FATAL(
+                connection_nodes.size() <= max_fabric2d_sender_connections,
+                "FABRIC_2D all-to-all needs {} physical first-hop connections, but the manager supports {}",
+                connection_nodes.size(),
+                max_fabric2d_sender_connections);
+            std::vector<uint32_t> connection_links;
+            connection_links.reserve(connection_nodes.size());
+            const uint32_t requested_link = core_id / num_senders_per_link;
+            for (const auto& connection_node : connection_nodes) {
+                const auto valid_links =
+                    tt::tt_fabric::get_forwarding_link_indices(sender_device_fabric_node_id, connection_node);
+                TT_FATAL(
+                    !valid_links.empty(),
+                    "No Fabric2D forwarding links from all-to-all source {} to first hop {}",
+                    sender_device_fabric_node_id,
+                    connection_node);
+                connection_links.push_back(valid_links[requested_link % valid_links.size()]);
+            }
+            sender_writer_rt_args.push_back(static_cast<uint32_t>(connection_nodes.size()));
+            tt::tt_fabric::append_routing_plane_connection_manager_rt_args(
+                sender_device_fabric_node_id,
+                connection_nodes,
+                connection_links,
+                program,
+                sender_writer_kernel_ids[sender_stream],
+                core,
+                sender_writer_rt_args,
+                tt::tt_fabric::FabricApiType::Linear);
         } else {
             const bool owns_positive_direction = !use_direction_owned_schedule || sender_stream < workers_per_direction;
             const bool owns_negative_direction =
